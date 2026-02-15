@@ -21,19 +21,29 @@ const AA_DOMAINS = [
 ];
 
 // --- LOGGING ---
+function timestamp() {
+  // Use TZ env var (e.g. Europe/Amsterdam) for local time; falls back to UTC
+  return new Date().toLocaleString('sv-SE', {
+    timeZone: process.env.TZ || 'UTC',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+    hour12: false,
+  });
+}
+
 function log(msg) {
-  console.log(`[${new Date().toISOString()}] ${msg}`);
+  console.log(`[${timestamp()}] ${msg}`);
 }
 
 function logError(msg, err) {
-  console.error(`[${new Date().toISOString()}] ERROR: ${msg}`, err ? err.message : '');
+  console.error(`[${timestamp()}] ERROR: ${msg}`, err ? err.message : '');
   if (err && err.stack) {
     console.error(err.stack);
   }
 }
 
 function logWarn(msg) {
-  console.warn(`[${new Date().toISOString()}] WARN: ${msg}`);
+  console.warn(`[${timestamp()}] WARN: ${msg}`);
 }
 
 // --- DATABASE SETUP ---

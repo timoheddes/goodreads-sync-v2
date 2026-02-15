@@ -8,11 +8,17 @@ services:
     ports:
       - "8191:8191"
     restart: unless-stopped
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
 
   book-sync:
     build: .
     container_name: book-sync
     restart: unless-stopped
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     environment:
       - TZ=Europe/Amsterdam
       - CRON_SCHEDULE=0 * * * *
