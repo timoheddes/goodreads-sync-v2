@@ -623,7 +623,15 @@ function sanitizeFilename(name) {
 
 // --- RUN CYCLE ---
 
+let cycleRunning = false;
+
 async function runCycle(trigger) {
+  if (cycleRunning) {
+    logWarn(`Cycle already running, ignoring trigger: ${trigger}`);
+    return;
+  }
+
+  cycleRunning = true;
   const cycleStart = Date.now();
   log(`========== CYCLE START (trigger: ${trigger}) ==========`);
 
@@ -636,6 +644,7 @@ async function runCycle(trigger) {
 
   const cycleElapsed = ((Date.now() - cycleStart) / 1000).toFixed(1);
   log(`========== CYCLE END (${cycleElapsed}s) ==========`);
+  cycleRunning = false;
 }
 
 // --- INIT ---
@@ -651,6 +660,13 @@ log(`  COOLDOWN:       ${QUEUE_COOLDOWN_MS}ms`);
 if (!AA_API_KEY) {
   logWarn('AA_API_KEY not set. Downloads will not work via fast_download API.');
 }
+
+// Manual trigger: send SIGUSR1 to kick off a cycle
+// Usage: docker kill --signal=SIGUSR1 book-sync
+process.on('SIGUSR1', () => {
+  log('Received SIGUSR1 — triggering manual cycle');
+  runCycle('manual');
+});
 
 (async () => {
   await runCycle('startup');

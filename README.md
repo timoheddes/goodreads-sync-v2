@@ -119,6 +119,16 @@ All configuration is via environment variables in `docker-compose.yml`:
 | `TZ`            | `Europe/Amsterdam`            | Timezone for logs and cron                           |
 | `DB_PATH`       | `/app/data/books.db`          | SQLite database path                                 |
 
+## Manual trigger
+
+To kick off a sync cycle without waiting for the cron schedule:
+
+```bash
+docker kill --signal=SIGUSR1 book-sync
+```
+
+This signals the running process to start a cycle immediately. If a cycle is already in progress, the signal is ignored. Check the logs to see it run (`trigger: manual`).
+
 ## Logs
 
 The service logs everything to stdout, viewable via:
