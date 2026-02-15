@@ -5,24 +5,18 @@ services:
     environment:
       - LOG_LEVEL=info
       - TZ=Europe/Amsterdam
-    ports:
-      - "8191:8191"
     restart: unless-stopped
-    dns:
-      - 1.1.1.1
-      - 8.8.8.8
+    network_mode: host
 
   book-sync:
     build: .
     container_name: book-sync
     restart: unless-stopped
-    dns:
-      - 1.1.1.1
-      - 8.8.8.8
+    network_mode: host
     environment:
       - TZ=Europe/Amsterdam
       - CRON_SCHEDULE=0 * * * *
-      - FLARE_URL=http://flaresolverr:8191/v1
+      - FLARE_URL=http://localhost:8191/v1
       - AA_API_KEY=${AA_API_KEY}
     volumes:
       - book-sync-data:/app/data
