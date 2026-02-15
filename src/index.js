@@ -481,7 +481,7 @@ async function findBookOnAnna(query, expectedTitle, expectedAuthor) {
           log(`  [Search] -> MATCH on result #${r + 1}`);
 
           if (AA_API_KEY) {
-            const url = `https://${domain}/fast_download/${md5}/${md5}?key=${AA_API_KEY}`;
+            const url = `https://${domain}/fast_download/${md5}/0/0?key=${AA_API_KEY}`;
             log(`  [Search] Using fast_download API: ${url.replace(AA_API_KEY, '***')}`);
             return url;
           }
