@@ -109,8 +109,8 @@ const stmts = {
     WHERE user_books.book_id = ?
   `),
   incrementAttempts: db.prepare('UPDATE books SET attempts = attempts + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?'),
-  markDownloaded: db.prepare('UPDATE books SET status = "downloaded", file_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?'),
-  markFailed: db.prepare('UPDATE books SET status = "failed", updated_at = CURRENT_TIMESTAMP WHERE id = ?'),
+  markDownloaded: db.prepare(`UPDATE books SET status = 'downloaded', file_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`),
+  markFailed: db.prepare(`UPDATE books SET status = 'failed', updated_at = CURRENT_TIMESTAMP WHERE id = ?`),
 };
 
 // --- RSS SYNC ---
