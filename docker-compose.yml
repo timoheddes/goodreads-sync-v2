@@ -13,12 +13,11 @@ services:
     build: .
     container_name: book-sync
     restart: unless-stopped
-    env_file:
-      - .env
     environment:
       - TZ=Europe/Amsterdam
       - CRON_SCHEDULE=0 * * * *
       - FLARE_URL=http://flaresolverr:8191/v1
+      - AA_API_KEY=${AA_API_KEY}
     volumes:
       - ./data:/app/data
       - /volume1/books:/downloads
