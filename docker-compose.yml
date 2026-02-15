@@ -19,7 +19,10 @@ services:
       - FLARE_URL=http://flaresolverr:8191/v1
       - AA_API_KEY=${AA_API_KEY}
     volumes:
-      - ./data:/app/data
+      - book-sync-data:/app/data
       - /volume1/books:/downloads
     depends_on:
       - flaresolverr
+
+volumes:
+  book-sync-data:
