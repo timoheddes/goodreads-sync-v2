@@ -242,8 +242,9 @@ async function processQueue() {
       return;
     }
 
-    // Build search query: prefer title + author, which works best on Anna's Archive
-    const searchTerm = [job.title, job.author].filter(Boolean).join(' ').trim();
+    // Build search query: strip series info like "(Culture, #3)" — it's noise for search
+    const cleanTitle = (job.title || '').replace(/\(.*?\)/g, '').trim();
+    const searchTerm = [cleanTitle, job.author].filter(Boolean).join(' ').trim();
     log(`[Queue] Processing: "${job.title}" by ${job.author || '?'} (search: "${searchTerm}", attempt ${job.attempts + 1}/${MAX_ATTEMPTS}, book_id: ${job.id})`);
 
     const jobStart = Date.now();
@@ -414,12 +415,19 @@ async function findBookOnAnna(query, expectedTitle, expectedAuthor) {
       const response = await axios.post(FLARESOLVERR_URL, {
         cmd: 'request.get',
         url: searchUrl,
-        maxTimeout: 60000,
+        maxTimeout: 120000,
       }, {
-        timeout: 90000, // Give FlareSolverr extra time
+        timeout: 150000, // Give FlareSolverr extra time beyond its own timeout
+        validateStatus: () => true, // Don't throw on 4xx/5xx — we handle it ourselves
       });
 
       const searchElapsed = ((Date.now() - searchStart) / 1000).toFixed(1);
+
+      if (response.status !== 200) {
+        const body = typeof response.data === 'string' ? response.data.substring(0, 500) : JSON.stringify(response.data).substring(0, 500);
+        logError(`[Search] FlareSolverr HTTP ${response.status} for ${domain} (${searchElapsed}s): ${body}`);
+        continue;
+      }
 
       if (response.data.status !== 'ok') {
         logError(`[Search] FlareSolverr returned status "${response.data.status}" for ${domain} (${searchElapsed}s). Message: ${response.data.message || 'none'}`);
@@ -678,7 +686,29 @@ process.on('SIGUSR1', () => {
   runCycle('manual');
 });
 
+async function waitForFlareSolverr(maxRetries = 30, intervalMs = 5000) {
+  log(`Waiting for FlareSolverr at ${FLARESOLVERR_URL}...`);
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const res = await axios.get(FLARESOLVERR_URL.replace('/v1', '/health'), {
+        timeout: 5000,
+        validateStatus: () => true,
+      });
+      log(`FlareSolverr is ready (attempt ${attempt}, status: ${res.status})`);
+      return;
+    } catch (err) {
+      log(`FlareSolverr not ready yet (attempt ${attempt}/${maxRetries}): ${err.code || err.message}`);
+      if (attempt < maxRetries) await sleep(intervalMs);
+    }
+  }
+
+  logWarn(`FlareSolverr did not become ready after ${maxRetries} attempts — proceeding anyway`);
+}
+
 (async () => {
+  await sleep(5000); // delayed startup
+  await waitForFlareSolverr();
   await runCycle('startup');
 })();
 
