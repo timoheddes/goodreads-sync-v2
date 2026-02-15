@@ -527,22 +527,55 @@ async function downloadBook(url, job) {
   let finalUrl = url;
 
   if (url.includes('/fast_download/')) {
-    log('[Download] Resolving fast_download API...');
-    const apiResponse = await axios.get(url, {
-      timeout: 30000,
-      validateStatus: (status) => status < 500,
+    log('[Download] Resolving fast_download page via FlareSolverr (Cloudflare-protected)...');
+
+    const flareResponse = await axios.post(FLARESOLVERR_URL, {
+      cmd: 'request.get',
+      url: url,
+      maxTimeout: 120000,
+    }, {
+      timeout: 150000,
+      validateStatus: () => true,
     });
 
-    log(`[Download] fast_download API response status: ${apiResponse.status}`);
+    if (flareResponse.status !== 200 || !flareResponse.data || flareResponse.data.status !== 'ok') {
+      const msg = flareResponse.data?.message || flareResponse.data?.status || `HTTP ${flareResponse.status}`;
+      throw new Error(`FlareSolverr failed to resolve fast_download page: ${msg}`);
+    }
 
-    if (apiResponse.data && apiResponse.data.download_url) {
-      finalUrl = apiResponse.data.download_url;
-      log(`[Download] Resolved download URL from JSON response`);
-    } else if (typeof apiResponse.data === 'string' && apiResponse.data.startsWith('http')) {
-      finalUrl = apiResponse.data;
-      log(`[Download] Resolved download URL from string response`);
+    const html = flareResponse.data.solution.response;
+    const resolvedUrl = flareResponse.data.solution.url;
+    log(`[Download] FlareSolverr resolved page (final URL: ${resolvedUrl}, HTML length: ${html.length})`);
+
+    // Parse the fast_download page for the actual download link
+    const $ = cheerio.load(html);
+
+    // Look for direct download links (common patterns on AA fast_download pages)
+    let downloadLink = null;
+
+    // Check for a direct link containing /dl/ or known file CDN patterns
+    $('a[href]').each((_, el) => {
+      const href = $(el).attr('href');
+      if (href && (href.includes('/dl/') || href.includes('cloudflare-ipfs') || href.includes('.epub') || href.includes('.pdf') || href.includes('download'))) {
+        if (!downloadLink) {
+          downloadLink = href;
+        }
+      }
+    });
+
+    if (downloadLink) {
+      // Make absolute if relative
+      if (downloadLink.startsWith('/')) {
+        const urlObj = new URL(url);
+        downloadLink = `${urlObj.protocol}//${urlObj.host}${downloadLink}`;
+      }
+      finalUrl = downloadLink;
+      log(`[Download] Found download link in page: ${finalUrl}`);
     } else {
-      logWarn(`[Download] fast_download response did not contain a redirect URL (type: ${typeof apiResponse.data}), trying direct download...`);
+      // Log a snippet of the page for debugging
+      const bodyText = $('body').text().replace(/\s+/g, ' ').trim().substring(0, 500);
+      logWarn(`[Download] Could not find download link in fast_download page. Page text: ${bodyText}`);
+      throw new Error('Could not extract download link from fast_download page');
     }
   }
 
