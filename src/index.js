@@ -14,6 +14,8 @@ const AA_API_KEY = process.env.AA_API_KEY;
 const FLARESOLVERR_URL = process.env.FLARE_URL || 'http://flaresolverr:8191/v1';
 const MAX_ATTEMPTS = 5;
 const QUEUE_COOLDOWN_MS = 5000; // 5 seconds between queue items
+const MAX_DOWNLOADS_PER_USER_PER_DAY = 10;
+const MAX_DOWNLOADS_PER_DAY = 50;
 
 const AA_DOMAINS = [
   'annas-archive.li',
@@ -36,21 +38,21 @@ function log(msg) {
 }
 
 function logError(msg, err) {
-  console.error(`[${timestamp()}] ERROR: ${msg}`, err ? err.message : '');
+  console.error(`[${timestamp()}] ❌ ${msg}`, err ? err.message : '');
   if (err && err.stack) {
     console.error(err.stack);
   }
 }
 
 function logWarn(msg) {
-  console.warn(`[${timestamp()}] WARN: ${msg}`);
+  console.warn(`[${timestamp()}] ⚠️  ${msg}`);
 }
 
 // --- DATABASE SETUP ---
-log(`Initialising database at: ${DB_PATH}`);
+log(`🗄️  Initialising database at: ${DB_PATH}`);
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
-log('Database connected (WAL mode)');
+log('🗄️  Database connected (WAL mode)');
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
@@ -86,7 +88,7 @@ db.exec(`
 // Migrate: add goodreads_book_id column if it doesn't exist (for existing DBs)
 try {
   db.exec(`ALTER TABLE books ADD COLUMN goodreads_book_id TEXT UNIQUE`);
-  log('Migration: added goodreads_book_id column to books table');
+  log('🗄️  Migration: added goodreads_book_id column to books table');
 } catch (e) {
   // Column already exists, ignore
 }
@@ -121,6 +123,24 @@ const stmts = {
   incrementAttempts: db.prepare('UPDATE books SET attempts = attempts + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?'),
   markDownloaded: db.prepare(`UPDATE books SET status = 'downloaded', file_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`),
   markFailed: db.prepare(`UPDATE books SET status = 'failed', updated_at = CURRENT_TIMESTAMP WHERE id = ?`),
+
+  // Daily download counts (using UTC dates since SQLite CURRENT_TIMESTAMP is UTC)
+  countDownloadsToday: db.prepare(`
+    SELECT COUNT(*) as cnt FROM books
+    WHERE status = 'downloaded' AND date(updated_at) = date('now')
+  `),
+  countUserDownloadsToday: db.prepare(`
+    SELECT COUNT(*) as cnt FROM books
+    JOIN user_books ON books.id = user_books.book_id
+    WHERE books.status = 'downloaded' AND date(books.updated_at) = date('now')
+    AND user_books.user_id = ?
+  `),
+  getUsersForBook: db.prepare(`
+    SELECT users.id, users.name, users.download_path
+    FROM users
+    JOIN user_books ON users.id = user_books.user_id
+    WHERE user_books.book_id = ?
+  `),
 };
 
 // --- RSS SYNC ---
@@ -136,22 +156,22 @@ const rssParser = new Parser({
 });
 
 async function syncRSS() {
-  log('Syncing RSS feeds...');
+  log('📚 Syncing RSS feeds...');
   const users = stmts.getUsers.all();
 
   if (users.length === 0) {
-    log('No users configured. Add users with: node src/add-user.js');
+    log('🚨 No users configured. Add users with: node src/add-user.js');
     return;
   }
 
-  log(`Found ${users.length} user(s): ${users.map(u => u.name).join(', ')}`);
+  log(`👥 Found ${users.length} user(s): ${users.map(u => u.name).join(', ')}`);
 
   for (const user of users) {
     try {
       const feedUrl = `https://www.goodreads.com/review/list_rss/${user.goodreads_id}?shelf=to-read`;
-      log(`[RSS] Fetching feed for ${user.name} (Goodreads ID: ${user.goodreads_id})`);
+      log(`📡 [RSS] Fetching feed for ${user.name} (Goodreads ID: ${user.goodreads_id})`);
       const feed = await rssParser.parseURL(feedUrl);
-      log(`[RSS] Feed returned ${feed.items.length} item(s) for ${user.name}`);
+      log(`📡 [RSS] Feed returned ${feed.items.length} item(s) for ${user.name}`);
 
       let newBooks = 0;
       let existingBooks = 0;
@@ -201,11 +221,11 @@ async function syncRSS() {
           existingBooks++;
         } else {
           newBooks++;
-          log(`[RSS] New book queued: "${title}" by ${author || '?'} (goodreads_book_id: ${goodreadsBookId})`);
+          log(`📗 [RSS] New book queued: "${title}" by ${author || '?'} (goodreads_book_id: ${goodreadsBookId})`);
         }
       }
 
-      log(`[RSS] ${user.name}: ${newBooks} new, ${existingBooks} existing, ${skipped} skipped`);
+      log(`📊 [RSS] ${user.name}: ${newBooks} new, ${existingBooks} existing, ${skipped} skipped`);
     } catch (err) {
       logError(`[RSS] Failed to sync user ${user.name}`, err);
     }
@@ -219,33 +239,58 @@ function sleep(ms) {
 }
 
 async function processQueue() {
-  log('[Queue] Processing queue...');
+  log('🔄 Processing queue...');
 
   // Log queue depth for visibility
   const pendingCount = db.prepare(`SELECT COUNT(*) as cnt FROM books WHERE status = 'pending' AND attempts < ?`).get(MAX_ATTEMPTS);
   const failedCount = db.prepare(`SELECT COUNT(*) as cnt FROM books WHERE status = 'failed'`).get();
-  log(`[Queue] ${pendingCount.cnt} pending, ${failedCount.cnt} permanently failed`);
+  const todayCount = stmts.countDownloadsToday.get();
+  log(`📊 [Queue] ${pendingCount.cnt} pending, ${failedCount.cnt} permanently failed, ${todayCount.cnt}/${MAX_DOWNLOADS_PER_DAY} downloaded today`);
+
+  // Check overall daily limit before starting
+  if (todayCount.cnt >= MAX_DOWNLOADS_PER_DAY) {
+    log(`🛑 [Queue] Daily download limit reached (${MAX_DOWNLOADS_PER_DAY}). Skipping queue until tomorrow.`);
+    return;
+  }
 
   let processed = 0;
   let succeeded = 0;
   let failed = 0;
+  let skippedLimit = 0;
 
   while (true) {
+    // Re-check overall daily limit after each download
+    const dailyCount = stmts.countDownloadsToday.get().cnt;
+    if (dailyCount >= MAX_DOWNLOADS_PER_DAY) {
+      log(`🛑 [Queue] Daily download limit reached (${dailyCount}/${MAX_DOWNLOADS_PER_DAY}). Stopping queue.`);
+      break;
+    }
+
     const job = stmts.getNextPending.get(MAX_ATTEMPTS);
 
     if (!job) {
-      if (processed === 0) {
-        log('[Queue] Queue empty. Nothing to process.');
-      } else {
-        log(`[Queue] Done. Processed ${processed} book(s): ${succeeded} succeeded, ${failed} failed.`);
-      }
-      return;
+      break;
     }
 
-    // Build search query: strip series info like "(Culture, #3)" — it's noise for search
+    // Check per-user daily limits: only proceed if at least one linked user has quota left
+    const linkedUsers = stmts.getUsersForBook.all(job.id);
+    const eligibleUsers = linkedUsers.filter(user => {
+      const userCount = stmts.countUserDownloadsToday.get(user.id).cnt;
+      return userCount < MAX_DOWNLOADS_PER_USER_PER_DAY;
+    });
+
+    if (eligibleUsers.length === 0) {
+      const userNames = linkedUsers.map(u => u.name).join(', ');
+      log(`⏭️  [Queue] Skipping "${job.title}" - all linked users (${userNames}) have reached their daily limit (${MAX_DOWNLOADS_PER_USER_PER_DAY}/day)`);
+      skippedLimit++;
+      // Don't count as an attempt - this isn't a failure, just rate limiting
+      continue;
+    }
+
+    // Build search query: strip series info like "(Culture, #3)" - it's noise for search
     const cleanTitle = (job.title || '').replace(/\(.*?\)/g, '').trim();
     const searchTerm = [cleanTitle, job.author].filter(Boolean).join(' ').trim();
-    log(`[Queue] Processing: "${job.title}" by ${job.author || '?'} (search: "${searchTerm}", attempt ${job.attempts + 1}/${MAX_ATTEMPTS}, book_id: ${job.id})`);
+    log(`📖 [Queue] Processing: "${job.title}" by ${job.author || '?'} (search: "${searchTerm}", attempt ${job.attempts + 1}/${MAX_ATTEMPTS}, book_id: ${job.id})`);
 
     const jobStart = Date.now();
 
@@ -265,23 +310,22 @@ async function processQueue() {
       }
 
       // 2. DOWNLOAD the file
-      log(`[Queue] Downloading from: ${downloadUrl}`);
+      log(`⬇️  [Queue] Downloading from: ${downloadUrl}`);
       const { filePath: tempPath, extension } = await downloadBook(downloadUrl, job);
 
-      // 3. COPY to each user's download folder
-      const userLinks = stmts.getUserPathsForBook.all(job.id);
+      // 3. COPY to eligible users' download folders (skip users at their daily limit)
       const safeTitle = sanitizeFilename(`${job.author || 'Unknown'} - ${job.title || 'Unknown'}`);
       const filename = `${safeTitle}${extension}`;
-      log(`[Queue] Copying "${filename}" to ${userLinks.length} user folder(s)...`);
+      log(`📂 [Queue] Copying "${filename}" to ${eligibleUsers.length} user folder(s)...`);
 
-      for (const link of userLinks) {
-        const destDir = link.download_path;
+      for (const user of eligibleUsers) {
+        const destDir = user.download_path;
         const destPath = path.join(destDir, filename);
 
         // Ensure the destination directory exists
         fs.mkdirSync(destDir, { recursive: true });
         fs.copyFileSync(tempPath, destPath);
-        log(`[Queue] Saved: ${destPath}`);
+        log(`💾 [Queue] Saved: ${destPath} (for ${user.name})`);
       }
 
       // Clean up temp file
@@ -294,7 +338,7 @@ async function processQueue() {
       // 4. Mark as downloaded
       stmts.markDownloaded.run(filename, job.id);
       const elapsed = ((Date.now() - jobStart) / 1000).toFixed(1);
-      log(`[Queue] SUCCESS: "${job.title}" by ${job.author || '?'} (${elapsed}s)`);
+      log(`✅ [Queue] SUCCESS: "${job.title}" by ${job.author || '?'} (${elapsed}s)`);
       succeeded++;
 
     } catch (err) {
@@ -303,10 +347,10 @@ async function processQueue() {
 
       // Mark as failed if we've exhausted attempts
       if (job.attempts + 1 >= MAX_ATTEMPTS) {
-        stmts.markFailed.run(job.id);
         logWarn(`[Queue] Permanently failed after ${MAX_ATTEMPTS} attempts: "${job.title}" by ${job.author || '?'}`);
+        stmts.markFailed.run(job.id);
       } else {
-        log(`[Queue] Will retry "${job.title}" on next run (${MAX_ATTEMPTS - job.attempts - 1} attempt(s) remaining)`);
+        log(`🔁 [Queue] Will retry "${job.title}" on next run (${MAX_ATTEMPTS - job.attempts - 1} attempt(s) remaining)`);
       }
       failed++;
     }
@@ -314,6 +358,12 @@ async function processQueue() {
     processed++;
     // Cooldown between items to avoid rate-limiting
     await sleep(QUEUE_COOLDOWN_MS);
+  }
+
+  if (processed === 0 && skippedLimit === 0) {
+    log('😴 [Queue] Queue empty. Nothing to process.');
+  } else {
+    log(`📊 [Queue] Done: ${succeeded} succeeded, ${failed} failed, ${skippedLimit} skipped (rate limit)`);
   }
 }
 
@@ -405,11 +455,11 @@ async function findBookOnAnna(query, expectedTitle, expectedAuthor) {
     const domain = AA_DOMAINS[i];
     const searchUrl = `https://${domain}/${searchParams}${encodeURIComponent(query)}`;
 
-    log(`[Search] Trying domain ${i + 1}/${AA_DOMAINS.length}: ${domain}`);
-    log(`[Search] URL: ${searchUrl}`);
+    log(`🌐 [Search] Trying domain ${i + 1}/${AA_DOMAINS.length}: ${domain}`);
+    log(`🔗 [Search] URL: ${searchUrl}`);
 
     try {
-      log(`[Search] Sending request via FlareSolverr (${FLARESOLVERR_URL})...`);
+      log(`🛡️  [Search] Sending request via FlareSolverr...`);
       const searchStart = Date.now();
 
       const response = await axios.post(FLARESOLVERR_URL, {
@@ -418,7 +468,7 @@ async function findBookOnAnna(query, expectedTitle, expectedAuthor) {
         maxTimeout: 120000,
       }, {
         timeout: 150000, // Give FlareSolverr extra time beyond its own timeout
-        validateStatus: () => true, // Don't throw on 4xx/5xx — we handle it ourselves
+        validateStatus: () => true, // Don't throw on 4xx/5xx - we handle it ourselves
       });
 
       const searchElapsed = ((Date.now() - searchStart) / 1000).toFixed(1);
@@ -435,14 +485,14 @@ async function findBookOnAnna(query, expectedTitle, expectedAuthor) {
       }
 
       const html = response.data.solution.response;
-      log(`[Search] FlareSolverr responded OK (${searchElapsed}s, HTML length: ${html.length} chars)`);
+      log(`🛡️  [Search] FlareSolverr responded OK (${searchElapsed}s, HTML: ${html.length} chars)`);
 
       const $ = cheerio.load(html);
 
       // Check if the results container exists at all
       const container = $('div.js-aarecord-list-outer');
       if (container.length === 0) {
-        logWarn(`[Search] Results container (div.js-aarecord-list-outer) not found on page — page structure may have changed`);
+        logWarn(`[Search] Results container (div.js-aarecord-list-outer) not found on page - page structure may have changed`);
         continue;
       }
 
@@ -450,12 +500,12 @@ async function findBookOnAnna(query, expectedTitle, expectedAuthor) {
       const resultDivs = container.children('div');
 
       if (resultDivs.length === 0) {
-        log(`[Search] No results found on ${domain} for: "${query}"`);
+        log(`🔍 [Search] No results found on ${domain} for: "${query}"`);
         continue;
       }
 
       const toCheck = Math.min(resultDivs.length, MAX_RESULTS_TO_CHECK);
-      log(`[Search] Found ${resultDivs.length} result(s), checking top ${toCheck}...`);
+      log(`🔍 [Search] Found ${resultDivs.length} result(s), checking top ${toCheck}...`);
 
       for (let r = 0; r < toCheck; r++) {
         const el = $(resultDivs[r]);
@@ -486,7 +536,7 @@ async function findBookOnAnna(query, expectedTitle, expectedAuthor) {
         log(`  [Search] Result #${r + 1}/${toCheck}: "${resultTitle}" by ${resultAuthor || '?'} (md5: ${md5})`);
 
         if (isGoodMatch(expectedTitle, expectedAuthor, resultTitle, resultAuthor)) {
-          log(`  [Search] -> MATCH on result #${r + 1}`);
+          log(`  ✅ [Search] -> MATCH on result #${r + 1}`);
 
           if (AA_API_KEY) {
             const url = `https://${domain}/fast_download/${md5}/0/0?key=${AA_API_KEY}`;
@@ -495,14 +545,14 @@ async function findBookOnAnna(query, expectedTitle, expectedAuthor) {
           }
 
           const url = `https://${domain}/md5/${md5}`;
-          log(`  [Search] No API key — returning detail page: ${url}`);
+          log(`  [Search] No API key - returning detail page: ${url}`);
           return url;
         }
 
-        log(`  [Search] -> No match on result #${r + 1}`);
+        log(`  ❎ [Search] -> No match on result #${r + 1}`);
       }
 
-      log(`[Search] None of the top ${toCheck} results matched "${expectedTitle}" by ${expectedAuthor || '?'} on ${domain}`);
+      log(`🔍 [Search] None of the top ${toCheck} results matched "${expectedTitle}" by ${expectedAuthor || '?'} on ${domain}`);
 
     } catch (err) {
       logError(`[Search] Failed on ${domain}`, err);
@@ -512,7 +562,7 @@ async function findBookOnAnna(query, expectedTitle, expectedAuthor) {
     }
   }
 
-  log(`[Search] Exhausted all ${AA_DOMAINS.length} domain(s) — book not found`);
+  log(`🔍 [Search] Exhausted all ${AA_DOMAINS.length} domain(s) - book not found`);
   return null;
 }
 
@@ -527,7 +577,7 @@ async function downloadBook(url, job) {
   let finalUrl = url;
 
   if (url.includes('/fast_download/')) {
-    log('[Download] Resolving fast_download page via FlareSolverr (Cloudflare-protected)...');
+    log('🛡️  [Download] Resolving fast_download page via FlareSolverr...');
 
     const flareResponse = await axios.post(FLARESOLVERR_URL, {
       cmd: 'request.get',
@@ -545,7 +595,7 @@ async function downloadBook(url, job) {
 
     const html = flareResponse.data.solution.response;
     const resolvedUrl = flareResponse.data.solution.url;
-    log(`[Download] FlareSolverr resolved page (final URL: ${resolvedUrl}, HTML length: ${html.length})`);
+    log(`🛡️  [Download] FlareSolverr resolved page (final URL: ${resolvedUrl}, HTML: ${html.length} chars)`);
 
     // Parse the fast_download page for the actual download link
     const $ = cheerio.load(html);
@@ -570,7 +620,7 @@ async function downloadBook(url, job) {
         downloadLink = `${urlObj.protocol}//${urlObj.host}${downloadLink}`;
       }
       finalUrl = downloadLink;
-      log(`[Download] Found download link in page: ${finalUrl}`);
+      log(`🔗 [Download] Found download link in page: ${finalUrl}`);
     } else {
       // Log a snippet of the page for debugging
       const bodyText = $('body').text().replace(/\s+/g, ' ').trim().substring(0, 500);
@@ -580,7 +630,7 @@ async function downloadBook(url, job) {
   }
 
   // Stream download the actual file
-  log(`[Download] Starting stream download (5 min timeout)...`);
+  log(`⬇️  [Download] Starting stream download (5 min timeout)...`);
   const dlStart = Date.now();
 
   const response = await axios.get(finalUrl, {
@@ -608,7 +658,7 @@ async function downloadBook(url, job) {
 
   const stats = fs.statSync(tempPath);
   const dlElapsed = ((Date.now() - dlStart) / 1000).toFixed(1);
-  log(`[Download] Completed: ${(stats.size / 1024 / 1024).toFixed(2)} MB in ${dlElapsed}s -> ${tempPath}`);
+  log(`⬇️  [Download] Completed: ${(stats.size / 1024 / 1024).toFixed(2)} MB in ${dlElapsed}s -> ${tempPath}`);
 
   if (stats.size < 1024) {
     // File is suspiciously small (< 1KB), probably an error page
@@ -684,7 +734,7 @@ async function runCycle(trigger) {
 
   cycleRunning = true;
   const cycleStart = Date.now();
-  log(`========== CYCLE START (trigger: ${trigger}) ==========`);
+  log(`\n🚀 ========== CYCLE START (trigger: ${trigger}) ==========`);
 
   try {
     await syncRSS();
@@ -694,33 +744,34 @@ async function runCycle(trigger) {
   }
 
   const cycleElapsed = ((Date.now() - cycleStart) / 1000).toFixed(1);
-  log(`========== CYCLE END (${cycleElapsed}s) ==========`);
+  log(`🏁 ========== CYCLE END (${cycleElapsed}s) ==========`);
   cycleRunning = false;
 }
 
 // --- INIT ---
-log('=== goodreads-sync service starting ===');
-log(`  DB_PATH:        ${DB_PATH}`);
-log(`  CRON_SCHEDULE:  ${CRON_SCHEDULE}`);
-log(`  FLARESOLVERR:   ${FLARESOLVERR_URL}`);
-log(`  AA_DOMAINS:     ${AA_DOMAINS.join(', ')}`);
-log(`  AA_API_KEY:     ${AA_API_KEY ? '***' + AA_API_KEY.slice(-4) : 'NOT SET'}`);
-log(`  MAX_ATTEMPTS:   ${MAX_ATTEMPTS}`);
-log(`  COOLDOWN:       ${QUEUE_COOLDOWN_MS}ms`);
+log('🚀 === goodreads-sync service starting ===');
+log(`  📁 DB_PATH:        ${DB_PATH}`);
+log(`  ⏰ CRON_SCHEDULE:  ${CRON_SCHEDULE}`);
+log(`  🛡️ FLARESOLVERR:   ${FLARESOLVERR_URL}`);
+log(`  🌐 AA_DOMAINS:     ${AA_DOMAINS.join(', ')}`);
+log(`  🔑 AA_API_KEY:     ${AA_API_KEY ? '***' + AA_API_KEY.slice(-4) : 'NOT SET'}`);
+log(`  🔁 MAX_ATTEMPTS:   ${MAX_ATTEMPTS}`);
+log(`  ⏱️ COOLDOWN:       ${QUEUE_COOLDOWN_MS}ms`);
+log(`  📊 DAILY_LIMIT:    ${MAX_DOWNLOADS_PER_DAY} overall, ${MAX_DOWNLOADS_PER_USER_PER_DAY} per user`);
 
 if (!AA_API_KEY) {
-  logWarn('AA_API_KEY not set. Downloads will not work via fast_download API.');
+  logWarn('⚠️ AA_API_KEY not set. Downloads will not work via fast_download API.');
 }
 
 // Manual trigger: send SIGUSR1 to kick off a cycle
 // Usage: docker kill --signal=SIGUSR1 book-sync
 process.on('SIGUSR1', () => {
-  log('Received SIGUSR1 — triggering manual cycle');
+  log('👆 Received SIGUSR1 - triggering manual cycle');
   runCycle('manual');
 });
 
 async function waitForFlareSolverr(maxRetries = 30, intervalMs = 5000) {
-  log(`Waiting for FlareSolverr at ${FLARESOLVERR_URL}...`);
+  log(`⏳ Waiting for FlareSolverr at ${FLARESOLVERR_URL}...`);
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
@@ -728,15 +779,15 @@ async function waitForFlareSolverr(maxRetries = 30, intervalMs = 5000) {
         timeout: 5000,
         validateStatus: () => true,
       });
-      log(`FlareSolverr is ready (attempt ${attempt}, status: ${res.status})`);
+      log(`✅ FlareSolverr is ready (attempt ${attempt}, status: ${res.status})`);
       return;
     } catch (err) {
-      log(`FlareSolverr not ready yet (attempt ${attempt}/${maxRetries}): ${err.code || err.message}`);
+      log(`⏳ FlareSolverr not ready yet (attempt ${attempt}/${maxRetries}): ${err.code || err.message}`);
       if (attempt < maxRetries) await sleep(intervalMs);
     }
   }
 
-  logWarn(`FlareSolverr did not become ready after ${maxRetries} attempts — proceeding anyway`);
+  logWarn(`⚠️ FlareSolverr did not become ready after ${maxRetries} attempts - proceeding anyway`);
 }
 
 (async () => {
