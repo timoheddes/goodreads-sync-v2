@@ -257,6 +257,7 @@ async function processQueue() {
   let succeeded = 0;
   let failed = 0;
   let skippedLimit = 0;
+  const skippedBookIds = [];
 
   while (true) {
     // Re-check overall daily limit after each download
@@ -266,7 +267,16 @@ async function processQueue() {
       break;
     }
 
-    const job = stmts.getNextPending.get(MAX_ATTEMPTS);
+    // Get next pending book, excluding any we already skipped due to rate limits
+    let job;
+    if (skippedBookIds.length === 0) {
+      job = stmts.getNextPending.get(MAX_ATTEMPTS);
+    } else {
+      const placeholders = skippedBookIds.map(() => '?').join(',');
+      job = db.prepare(
+        `SELECT * FROM books WHERE status = 'pending' AND attempts < ? AND id NOT IN (${placeholders}) ORDER BY attempts ASC LIMIT 1`
+      ).get(MAX_ATTEMPTS, ...skippedBookIds);
+    }
 
     if (!job) {
       break;
@@ -281,9 +291,9 @@ async function processQueue() {
 
     if (eligibleUsers.length === 0) {
       const userNames = linkedUsers.map(u => u.name).join(', ');
-      log(`⏭️  [Queue] Skipping "${job.title}" - all linked users (${userNames}) have reached their daily limit (${MAX_DOWNLOADS_PER_USER_PER_DAY}/day)`);
+      log(`⏭️  [Queue] Skipping "${job.title}" — all linked users (${userNames}) at daily limit (${MAX_DOWNLOADS_PER_USER_PER_DAY}/day)`);
+      skippedBookIds.push(job.id);
       skippedLimit++;
-      // Don't count as an attempt - this isn't a failure, just rate limiting
       continue;
     }
 
