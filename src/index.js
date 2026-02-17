@@ -259,6 +259,16 @@ async function processQueue() {
   let skippedLimit = 0;
   const skippedBookIds = [];
 
+  // Check per-user daily limits once upfront and log a single message per user at limit
+  const rateLimitedUserIds = new Set();
+  for (const user of stmts.getUsers.all()) {
+    const userCount = stmts.countUserDownloadsToday.get(user.id).cnt;
+    if (userCount >= MAX_DOWNLOADS_PER_USER_PER_DAY) {
+      rateLimitedUserIds.add(user.id);
+      log(`🛑 [Queue] User "${user.name}" has reached their daily limit (${userCount}/${MAX_DOWNLOADS_PER_USER_PER_DAY}). Skipping their books.`);
+    }
+  }
+
   while (true) {
     // Re-check overall daily limit after each download
     const dailyCount = stmts.countDownloadsToday.get().cnt;
@@ -284,14 +294,9 @@ async function processQueue() {
 
     // Check per-user daily limits: only proceed if at least one linked user has quota left
     const linkedUsers = stmts.getUsersForBook.all(job.id);
-    const eligibleUsers = linkedUsers.filter(user => {
-      const userCount = stmts.countUserDownloadsToday.get(user.id).cnt;
-      return userCount < MAX_DOWNLOADS_PER_USER_PER_DAY;
-    });
+    const eligibleUsers = linkedUsers.filter(u => !rateLimitedUserIds.has(u.id));
 
     if (eligibleUsers.length === 0) {
-      const userNames = linkedUsers.map(u => u.name).join(', ');
-      log(`⏭️  [Queue] Skipping "${job.title}" — all linked users (${userNames}) at daily limit (${MAX_DOWNLOADS_PER_USER_PER_DAY}/day)`);
       skippedBookIds.push(job.id);
       skippedLimit++;
       continue;
@@ -350,6 +355,17 @@ async function processQueue() {
       const elapsed = ((Date.now() - jobStart) / 1000).toFixed(1);
       log(`✅ [Queue] SUCCESS: "${job.title}" by ${job.author || '?'} (${elapsed}s)`);
       succeeded++;
+
+      // Refresh per-user limits — a user may have just hit their cap
+      for (const user of eligibleUsers) {
+        if (!rateLimitedUserIds.has(user.id)) {
+          const userCount = stmts.countUserDownloadsToday.get(user.id).cnt;
+          if (userCount >= MAX_DOWNLOADS_PER_USER_PER_DAY) {
+            rateLimitedUserIds.add(user.id);
+            log(`🛑 [Queue] User "${user.name}" has now reached their daily limit (${userCount}/${MAX_DOWNLOADS_PER_USER_PER_DAY}).`);
+          }
+        }
+      }
 
     } catch (err) {
       const elapsed = ((Date.now() - jobStart) / 1000).toFixed(1);
