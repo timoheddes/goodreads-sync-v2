@@ -6,6 +6,7 @@ const cron = require('node-cron');
 const Parser = require('rss-parser');
 const axios = require('axios');
 const cheerio = require('cheerio');
+const nodemailer = require('nodemailer');
 
 // --- CONFIG ---
 const DB_PATH = process.env.DB_PATH || '/app/data/books.db';
@@ -16,6 +17,9 @@ const MAX_ATTEMPTS = 5;
 const QUEUE_COOLDOWN_MS = 5000; // 5 seconds between queue items
 const MAX_DOWNLOADS_PER_USER_PER_DAY = 10;
 const MAX_DOWNLOADS_PER_DAY = 50;
+const SMTP_HOST = process.env.SMTP_HOST || 'localhost';
+const SMTP_PORT = parseInt(process.env.SMTP_PORT || '25', 10);
+const SMTP_FROM = process.env.SMTP_FROM || '';
 
 const AA_DOMAINS = [
   'annas-archive.li',
@@ -93,6 +97,14 @@ try {
   // Column already exists, ignore
 }
 
+// Migrate: add email column to users table
+try {
+  db.exec(`ALTER TABLE users ADD COLUMN email TEXT`);
+  log('🗄️  Migration: added email column to users table');
+} catch (e) {
+  // Column already exists, ignore
+}
+
 // --- PREPARED STATEMENTS ---
 const stmts = {
   getUsers: db.prepare('SELECT * FROM users'),
@@ -136,7 +148,7 @@ const stmts = {
     AND user_books.user_id = ?
   `),
   getUsersForBook: db.prepare(`
-    SELECT users.id, users.name, users.download_path
+    SELECT users.id, users.name, users.download_path, users.email
     FROM users
     JOIN user_books ON users.id = user_books.user_id
     WHERE user_books.book_id = ?
@@ -258,6 +270,7 @@ async function processQueue() {
   let failed = 0;
   let skippedLimit = 0;
   const skippedBookIds = [];
+  const downloadedPerUser = new Map(); // userId -> { user, books[] }
 
   // Check per-user daily limits once upfront and log a single message per user at limit
   const rateLimitedUserIds = new Set();
@@ -356,6 +369,14 @@ async function processQueue() {
       log(`✅ [Queue] SUCCESS: "${job.title}" by ${job.author || '?'} (${elapsed}s)`);
       succeeded++;
 
+      // Track this download for each user who received it (for email notifications)
+      for (const user of eligibleUsers) {
+        if (!downloadedPerUser.has(user.id)) {
+          downloadedPerUser.set(user.id, { user, books: [] });
+        }
+        downloadedPerUser.get(user.id).books.push({ title: job.title, author: job.author });
+      }
+
       // Refresh per-user limits — a user may have just hit their cap
       for (const user of eligibleUsers) {
         if (!rateLimitedUserIds.has(user.id)) {
@@ -391,6 +412,8 @@ async function processQueue() {
   } else {
     log(`📊 [Queue] Done: ${succeeded} succeeded, ${failed} failed, ${skippedLimit} skipped (rate limit)`);
   }
+
+  return downloadedPerUser;
 }
 
 // --- FUZZY MATCHING ---
@@ -748,6 +771,100 @@ function sanitizeFilename(name) {
     .substring(0, 200);             // Cap length
 }
 
+// --- EMAIL NOTIFICATIONS ---
+
+const smtpTransport = nodemailer.createTransport({
+  host: SMTP_HOST,
+  port: SMTP_PORT,
+  secure: false,
+  tls: { rejectUnauthorized: false },
+});
+
+function buildEmailHtml(userName, books) {
+  const bookRows = books.map(b => `
+    <tr>
+      <td style="padding: 12px 16px; border-bottom: 1px solid #f0f0f0;">
+        <strong style="color: #1a1a1a;">${b.title || 'Unknown Title'}</strong>
+        <br>
+        <span style="color: #666; font-size: 14px;">${b.author || 'Unknown Author'}</span>
+      </td>
+    </tr>
+  `).join('');
+
+  return `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="margin: 0; padding: 0; background-color: #f5f5f5; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #f5f5f5; padding: 32px 0;">
+    <tr>
+      <td align="center">
+        <table width="560" cellpadding="0" cellspacing="0" style="background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.08);">
+          <!-- Header -->
+          <tr>
+            <td style="background-color: #2d3748; padding: 28px 32px; text-align: center;">
+              <span style="font-size: 28px;">📚</span>
+              <h1 style="color: #ffffff; margin: 8px 0 0; font-size: 20px; font-weight: 600;">New books ready!</h1>
+            </td>
+          </tr>
+          <!-- Greeting -->
+          <tr>
+            <td style="padding: 28px 32px 16px;">
+              <p style="color: #333; font-size: 16px; margin: 0;">
+                Hi ${userName},
+              </p>
+              <p style="color: #555; font-size: 15px; margin: 12px 0 0;">
+                ${books.length === 1 ? 'A new book was' : `${books.length} new books were`} downloaded and ${books.length === 1 ? 'is' : 'are'} ready for you to read.
+              </p>
+            </td>
+          </tr>
+          <!-- Book list -->
+          <tr>
+            <td style="padding: 0 32px 24px;">
+              <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #fafafa; border-radius: 8px; border: 1px solid #eee;">
+                ${bookRows}
+              </table>
+            </td>
+          </tr>
+          <!-- Footer -->
+          <tr>
+            <td style="padding: 16px 32px 28px; text-align: center;">
+              <p style="color: #999; font-size: 13px; margin: 0;">Happy reading!</p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`;
+}
+
+async function sendDownloadNotification(user, books) {
+  if (!user.email) return;
+  if (!SMTP_FROM) {
+    logWarn(`[Email] SMTP_FROM not configured — skipping email for ${user.name}`);
+    return;
+  }
+  if (books.length === 0) return;
+
+  const subject = books.length === 1
+    ? `📚 "${books[0].title}" is ready to read`
+    : `📚 ${books.length} new books are ready to read`;
+
+  try {
+    await smtpTransport.sendMail({
+      from: SMTP_FROM,
+      to: user.email,
+      subject,
+      html: buildEmailHtml(user.name, books),
+    });
+    log(`📧 [Email] Sent notification to ${user.name} (${user.email}): ${books.length} book(s)`);
+  } catch (err) {
+    logError(`[Email] Failed to send to ${user.name} (${user.email})`, err);
+  }
+}
+
 // --- RUN CYCLE ---
 
 let cycleRunning = false;
@@ -764,7 +881,15 @@ async function runCycle(trigger) {
 
   try {
     await syncRSS();
-    await processQueue();
+    const downloadedPerUser = await processQueue();
+
+    // Send email notifications to users who had books downloaded this cycle
+    if (downloadedPerUser && downloadedPerUser.size > 0) {
+      log(`📧 [Email] Sending notifications to ${downloadedPerUser.size} user(s)...`);
+      for (const { user, books } of downloadedPerUser.values()) {
+        await sendDownloadNotification(user, books);
+      }
+    }
   } catch (err) {
     logError(`Cycle failed (trigger: ${trigger})`, err);
   }
@@ -784,6 +909,8 @@ log(`  🔑 AA_API_KEY:     ${AA_API_KEY ? '***' + AA_API_KEY.slice(-4) : 'NOT S
 log(`  🔁 MAX_ATTEMPTS:   ${MAX_ATTEMPTS}`);
 log(`  ⏱️ COOLDOWN:       ${QUEUE_COOLDOWN_MS}ms`);
 log(`  📊 DAILY_LIMIT:    ${MAX_DOWNLOADS_PER_DAY} overall, ${MAX_DOWNLOADS_PER_USER_PER_DAY} per user`);
+log(`  📧 SMTP:           ${SMTP_FROM ? `${SMTP_HOST}:${SMTP_PORT} (from: ${SMTP_FROM})` : 'NOT CONFIGURED'}`);
+log(`  👥 USERS:          ${stmts.getUsers.all().map(u => u.name).join(', ')}`);
 
 if (!AA_API_KEY) {
   logWarn('⚠️ AA_API_KEY not set. Downloads will not work via fast_download API.');

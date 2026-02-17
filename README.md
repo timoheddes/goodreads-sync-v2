@@ -42,11 +42,15 @@ cd goodreads-sync-v2
 cp .env.example .env
 ```
 
-Edit `.env` and add your Anna's Archive API key:
+Edit `.env` and fill in your keys:
 
 ```
 AA_API_KEY=your_actual_api_key
+SMTP_USER=your_email@gmail.com
+SMTP_PASS=your_app_password
 ```
+
+`SMTP_USER` and `SMTP_PASS` are used by the SMTP relay to send email notifications via Gmail. For Gmail, you'll need an [App Password](https://myaccount.google.com/apppasswords) (not your regular password). Email notifications are optional — if you skip these, everything else still works.
 
 ### 3. Configure the volume mount
 
@@ -72,7 +76,7 @@ docker compose up -d --build
 
 1. Go to Stacks → Add stack
 2. Choose "Repository" and point it to your GitHub repo
-3. Add `AA_API_KEY` as an environment variable in the Portainer UI
+3. Add environment variables in the Portainer UI: `AA_API_KEY`, `SMTP_USER`, `SMTP_PASS`
 4. Deploy the stack
 
 ### 5. Add users
@@ -82,13 +86,13 @@ The service must be running before adding users (it creates the database tables 
 **Via the helper script:**
 
 ```bash
-./add-user.sh "Alice" "104614681" "/downloads/Alice"
+./add-user.sh "Alice" "104614681" "/downloads/Alice" "alice@example.com"
 ```
 
 **Via docker exec directly:**
 
 ```bash
-docker exec -it book-sync node src/add-user.js "Alice" "104614681" "/downloads/Alice"
+docker exec -it book-sync node src/add-user.js "Alice" "104614681" "/downloads/Alice" "alice@example.com"
 ```
 
 **Via Portainer console:**
@@ -96,16 +100,43 @@ docker exec -it book-sync node src/add-user.js "Alice" "104614681" "/downloads/A
 Open a console on the `book-sync` container and run:
 
 ```bash
-node src/add-user.js "Alice" "104614681" "/downloads/Alice"
+node src/add-user.js "Alice" "104614681" "/downloads/Alice" "alice@example.com"
 ```
 
 Arguments:
 
-- `"Alice"` — Display name (for logs)
+- `"Alice"` — Display name (for logs and emails)
 - `"104614681"` — Goodreads user ID
 - `"/downloads/Alice"` — Download path **inside the container** (maps to your NAS volume)
+- `"alice@example.com"` — Email address for download notifications (optional)
 
-You can add multiple users. Each user gets their own download folder and their books are synced independently.
+You can add multiple users. Each user gets their own download folder and their books are synced independently. If an email is provided and SMTP is configured, the user will receive a notification whenever new books are downloaded.
+
+### 6. Update users
+
+To update an existing user (e.g. add an email address), use their Goodreads ID:
+
+```bash
+./update-user.sh "104614681" --email "alice@example.com"
+```
+
+You can update multiple fields at once:
+
+```bash
+./update-user.sh "104614681" --name "Alice B" --email "alice@example.com" --path "/downloads/AliceB"
+```
+
+To clear an email (stop notifications):
+
+```bash
+./update-user.sh "104614681" --email ""
+```
+
+Or via docker exec / Portainer console:
+
+```bash
+node src/update-user.js "104614681" --email "alice@example.com"
+```
 
 ## Configuration
 
@@ -118,6 +149,9 @@ All configuration is via environment variables in `docker-compose.yml`:
 | `FLARE_URL`     | `http://flaresolverr:8191/v1` | FlareSolverr endpoint                                |
 | `TZ`            | `Europe/Amsterdam`            | Timezone for logs and cron                           |
 | `DB_PATH`       | `/app/data/books.db`          | SQLite database path                                 |
+| `SMTP_USER`     | _(optional)_                  | Gmail address for the SMTP relay (set in `.env`)     |
+| `SMTP_PASS`     | _(optional)_                  | Gmail app password for the SMTP relay (set in `.env`) |
+| `SMTP_FROM`     | `${SMTP_USER}`                | Sender address for notification emails               |
 
 ## Manual trigger
 

@@ -8,6 +8,17 @@ services:
     restart: unless-stopped
     network_mode: host
 
+  smtp:
+    image: namshi/smtp
+    container_name: book-sync-smtp
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - RELAY_HOST=smtp.gmail.com
+      - RELAY_PORT=587
+      - RELAY_USERNAME=${SMTP_USER}
+      - RELAY_PASSWORD=${SMTP_PASS}
+
   book-sync:
     build: .
     container_name: book-sync
@@ -18,11 +29,15 @@ services:
       - CRON_SCHEDULE=0 * * * *
       - FLARE_URL=http://localhost:8191/v1
       - AA_API_KEY=${AA_API_KEY}
+      - SMTP_HOST=localhost
+      - SMTP_PORT=25
+      - SMTP_FROM=${SMTP_USER}
     volumes:
       - book-sync-data:/app/data
       - /volume1/books:/downloads
     depends_on:
       - flaresolverr
+      - smtp
 
 volumes:
   book-sync-data:
