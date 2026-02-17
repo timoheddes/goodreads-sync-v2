@@ -129,6 +129,29 @@ docker kill --signal=SIGUSR1 book-sync
 
 This signals the running process to start a cycle immediately. If a cycle is already in progress, the signal is ignored. Check the logs to see it run (`trigger: manual`).
 
+## Reset database
+
+To wipe all books and download history (users are kept):
+
+```bash
+./reset-db.sh --confirm
+```
+
+To wipe everything including users:
+
+```bash
+./reset-db.sh --all
+```
+
+Or via docker exec / Portainer console:
+
+```bash
+node src/reset-db.js --confirm
+node src/reset-db.js --all
+```
+
+After a reset, the next sync cycle will re-discover all books from each user's to-read shelf and queue them as pending.
+
 ## Logs
 
 The service logs everything to stdout, viewable via:
