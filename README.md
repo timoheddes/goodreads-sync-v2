@@ -163,6 +163,20 @@ docker kill --signal=SIGUSR1 book-sync
 
 This signals the running process to start a cycle immediately. If a cycle is already in progress, the signal is ignored. Check the logs to see it run (`trigger: manual`).
 
+## Reset download limits
+
+To clear today's download limits so the queue can resume immediately:
+
+```bash
+./reset-limits.sh
+```
+
+This shifts today's `downloaded_at` timestamps to yesterday, making all users eligible again. Combine with a manual trigger to resume downloading right away:
+
+```bash
+./reset-limits.sh && docker kill --signal=SIGUSR1 book-sync
+```
+
 ## Reset database
 
 To wipe all books and download history (users are kept):

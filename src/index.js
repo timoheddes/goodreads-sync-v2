@@ -105,6 +105,16 @@ try {
   // Column already exists, ignore
 }
 
+// Migrate: add downloaded_at column (updated_at gets bumped by RSS upserts, so it's unreliable for rate limiting)
+try {
+  db.exec(`ALTER TABLE books ADD COLUMN downloaded_at DATETIME`);
+  // Backfill: set downloaded_at for already-downloaded books that don't have it
+  db.exec(`UPDATE books SET downloaded_at = updated_at WHERE status = 'downloaded' AND downloaded_at IS NULL`);
+  log('🗄️  Migration: added downloaded_at column to books table');
+} catch (e) {
+  // Column already exists, ignore
+}
+
 // --- PREPARED STATEMENTS ---
 const stmts = {
   getUsers: db.prepare('SELECT * FROM users'),
@@ -133,18 +143,18 @@ const stmts = {
     WHERE user_books.book_id = ?
   `),
   incrementAttempts: db.prepare('UPDATE books SET attempts = attempts + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?'),
-  markDownloaded: db.prepare(`UPDATE books SET status = 'downloaded', file_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`),
+  markDownloaded: db.prepare(`UPDATE books SET status = 'downloaded', file_path = ?, downloaded_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`),
   markFailed: db.prepare(`UPDATE books SET status = 'failed', updated_at = CURRENT_TIMESTAMP WHERE id = ?`),
 
-  // Daily download counts (using UTC dates since SQLite CURRENT_TIMESTAMP is UTC)
+  // Daily download counts based on downloaded_at (not updated_at, which gets bumped by RSS upserts)
   countDownloadsToday: db.prepare(`
     SELECT COUNT(*) as cnt FROM books
-    WHERE status = 'downloaded' AND date(updated_at) = date('now')
+    WHERE status = 'downloaded' AND date(downloaded_at) = date('now')
   `),
   countUserDownloadsToday: db.prepare(`
     SELECT COUNT(*) as cnt FROM books
     JOIN user_books ON books.id = user_books.book_id
-    WHERE books.status = 'downloaded' AND date(books.updated_at) = date('now')
+    WHERE books.status = 'downloaded' AND date(books.downloaded_at) = date('now')
     AND user_books.user_id = ?
   `),
   getUsersForBook: db.prepare(`
