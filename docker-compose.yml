@@ -32,6 +32,8 @@ services:
       - SMTP_HOST=localhost
       - SMTP_PORT=25
       - SMTP_FROM=${SMTP_USER}
+      - MAX_DOWNLOADS_PER_USER_PER_DAY=${MAX_DOWNLOADS_PER_USER_PER_DAY}
+      - MAX_DOWNLOADS_PER_DAY=${MAX_DOWNLOADS_PER_DAY}
     volumes:
       - book-sync-data:/app/data
       - ${DOWNLOADS_PATH}:/downloads
