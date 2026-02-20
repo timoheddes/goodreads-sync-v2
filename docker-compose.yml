@@ -34,7 +34,7 @@ services:
       - SMTP_FROM=${SMTP_USER}
     volumes:
       - book-sync-data:/app/data
-      - /volume1/homes/kolsterheddes/books:/downloads
+      - ${DOWNLOADS_PATH}:/downloads
     depends_on:
       - flaresolverr
       - smtp

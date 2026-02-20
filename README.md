@@ -46,23 +46,22 @@ Edit `.env` and fill in your keys:
 
 ```
 AA_API_KEY=your_actual_api_key
+DOWNLOADS_PATH=/volume1/books
 SMTP_USER=your_email@gmail.com
 SMTP_PASS=your_app_password
 ```
 
 `SMTP_USER` and `SMTP_PASS` are used by the SMTP relay to send email notifications via Gmail. For Gmail, you'll need an [App Password](https://myaccount.google.com/apppasswords) (not your regular password). Email notifications are optional — if you skip these, everything else still works.
 
-### 3. Configure the volume mount
+### 3. Configure the downloads path
 
-Edit `docker-compose.yml` and change the books volume to match your NAS path:
+Set `DOWNLOADS_PATH` in your `.env` file to the path on your NAS where books should be saved:
 
-```yaml
-volumes:
-  - ./data:/app/data
-  - /volume1/books:/downloads # Change /volume1/books to your NAS path
+```
+DOWNLOADS_PATH=/volume1/books
 ```
 
-The left side is the path on your NAS, the right side (`/downloads`) is where it appears inside the container. When adding users later, their download paths should start with `/downloads/`.
+This maps to `/downloads` inside the container. When adding users later, their download paths should start with `/downloads/`.
 
 ### 4. Deploy
 
@@ -156,10 +155,11 @@ node src/list-users.js
 
 All configuration is via environment variables in `docker-compose.yml`:
 
-| Variable        | Default                       | Description                                          |
-| --------------- | ----------------------------- | ---------------------------------------------------- |
-| `AA_API_KEY`    | _(required)_                  | Anna's Archive API key (set in `.env`)               |
-| `CRON_SCHEDULE` | `0 * * * *`                   | How often to sync (cron syntax, default: every hour) |
+| Variable          | Default                       | Description                                          |
+| ----------------- | ----------------------------- | ---------------------------------------------------- |
+| `AA_API_KEY`      | _(required)_                  | Anna's Archive API key (set in `.env`)               |
+| `DOWNLOADS_PATH`  | _(required)_                  | Host path to mount as `/downloads` (set in `.env`)   |
+| `CRON_SCHEDULE`   | `0 * * * *`                   | How often to sync (cron syntax, default: every hour) |
 | `FLARE_URL`     | `http://flaresolverr:8191/v1` | FlareSolverr endpoint                                |
 | `TZ`            | `Europe/Amsterdam`            | Timezone for logs and cron                           |
 | `DB_PATH`       | `/app/data/books.db`          | SQLite database path                                 |
