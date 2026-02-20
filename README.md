@@ -138,6 +138,20 @@ Or via docker exec / Portainer console:
 node src/update-user.js "104614681" --email "alice@example.com"
 ```
 
+### 7. List users
+
+To see all configured users and their settings:
+
+```bash
+./list-users.sh
+```
+
+Or via docker exec / Portainer console:
+
+```bash
+node src/list-users.js
+```
+
 ## Configuration
 
 All configuration is via environment variables in `docker-compose.yml`:
