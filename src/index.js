@@ -631,16 +631,19 @@ async function downloadBook(url, job) {
   const tempDir = path.join(path.dirname(DB_PATH), 'tmp');
   fs.mkdirSync(tempDir, { recursive: true });
 
-  // If using the fast_download API, it returns JSON with a download link
-  // We need to follow it to get the actual file
-  let finalUrl = url;
+  let extraHeaders = {};
 
   if (url.includes('/fast_download/')) {
-    log('🛡️  [Download] Resolving fast_download page via FlareSolverr...');
+    // fast_download is a direct file link (not an HTML page).
+    // Use FlareSolverr to obtain Cloudflare clearance cookies from the domain,
+    // then pass those cookies when downloading the file with axios.
+    const urlObj = new URL(url);
+    const baseUrl = `${urlObj.protocol}//${urlObj.host}/`;
+    log(`🛡️  [Download] Obtaining Cloudflare cookies via FlareSolverr (${baseUrl})...`);
 
     const flareResponse = await axios.post(FLARESOLVERR_URL, {
       cmd: 'request.get',
-      url: url,
+      url: baseUrl,
       maxTimeout: 120000,
     }, {
       timeout: 150000,
@@ -649,53 +652,31 @@ async function downloadBook(url, job) {
 
     if (flareResponse.status !== 200 || !flareResponse.data || flareResponse.data.status !== 'ok') {
       const msg = flareResponse.data?.message || flareResponse.data?.status || `HTTP ${flareResponse.status}`;
-      throw new Error(`FlareSolverr failed to resolve fast_download page: ${msg}`);
+      throw new Error(`FlareSolverr failed to obtain Cloudflare cookies: ${msg}`);
     }
 
-    const html = flareResponse.data.solution.response;
-    const resolvedUrl = flareResponse.data.solution.url;
-    log(`🛡️  [Download] FlareSolverr resolved page (final URL: ${resolvedUrl}, HTML: ${html.length} chars)`);
+    const solution = flareResponse.data.solution;
+    const cookies = (solution.cookies || [])
+      .map(c => `${c.name}=${c.value}`)
+      .join('; ');
+    const userAgent = solution.userAgent || 'Mozilla/5.0';
+    log(`🛡️  [Download] Got ${solution.cookies?.length || 0} cookies, UA: ${userAgent.substring(0, 60)}...`);
 
-    // Parse the fast_download page for the actual download link
-    const $ = cheerio.load(html);
-
-    // Look for direct download links (common patterns on AA fast_download pages)
-    let downloadLink = null;
-
-    // Check for a direct link containing /dl/ or known file CDN patterns
-    $('a[href]').each((_, el) => {
-      const href = $(el).attr('href');
-      if (href && (href.includes('/dl/') || href.includes('cloudflare-ipfs') || href.includes('.epub') || href.includes('.pdf') || href.includes('download'))) {
-        if (!downloadLink) {
-          downloadLink = href;
-        }
-      }
-    });
-
-    if (downloadLink) {
-      // Make absolute if relative
-      if (downloadLink.startsWith('/')) {
-        const urlObj = new URL(url);
-        downloadLink = `${urlObj.protocol}//${urlObj.host}${downloadLink}`;
-      }
-      finalUrl = downloadLink;
-      log(`🔗 [Download] Found download link in page: ${finalUrl}`);
-    } else {
-      // Log a snippet of the page for debugging
-      const bodyText = $('body').text().replace(/\s+/g, ' ').trim().substring(0, 500);
-      logWarn(`[Download] Could not find download link in fast_download page. Page text: ${bodyText}`);
-      throw new Error('Could not extract download link from fast_download page');
-    }
+    extraHeaders = {
+      'Cookie': cookies,
+      'User-Agent': userAgent,
+    };
   }
 
-  // Stream download the actual file
+  // Stream download the file
   log(`⬇️  [Download] Starting stream download (5 min timeout)...`);
   const dlStart = Date.now();
 
-  const response = await axios.get(finalUrl, {
+  const response = await axios.get(url, {
     responseType: 'stream',
-    timeout: 300000, // 5 min timeout for large files
+    timeout: 300000,
     maxRedirects: 10,
+    headers: extraHeaders,
   });
 
   // Log response headers for debugging
