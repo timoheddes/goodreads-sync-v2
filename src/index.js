@@ -630,6 +630,43 @@ async function findBookOnAnna(query, expectedTitle, expectedAuthor) {
 
 const CHROMIUM_PATH = process.env.CHROMIUM_PATH || '/usr/bin/chromium-browser';
 
+async function applyStealthPatches(page) {
+  await page.evaluateOnNewDocument(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    Object.defineProperty(navigator, 'plugins', {
+      get: () => [1, 2, 3, 4, 5],
+    });
+    Object.defineProperty(navigator, 'languages', {
+      get: () => ['en-US', 'en'],
+    });
+    window.chrome = { runtime: {}, loadTimes: () => {}, csi: () => {} };
+    const origQuery = window.navigator.permissions.query.bind(window.navigator.permissions);
+    window.navigator.permissions.query = (params) =>
+      params.name === 'notifications'
+        ? Promise.resolve({ state: Notification.permission })
+        : origQuery(params);
+  });
+  await page.setUserAgent(
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+  );
+  await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
+}
+
+async function waitForCloudflare(page, timeoutMs = 60000) {
+  const startTime = Date.now();
+  while (Date.now() - startTime < timeoutMs) {
+    const title = await page.title().catch(() => '');
+    if (title.includes('Just a moment') || title.includes('Checking') || title.includes('Attention Required')) {
+      log('🌐 [BrowserDL] Cloudflare challenge detected, waiting...');
+      await sleep(3000);
+      continue;
+    }
+    // Real page loaded — challenge is solved (or was never shown)
+    return;
+  }
+  throw new Error('Cloudflare challenge did not resolve within timeout');
+}
+
 async function downloadWithBrowser(url, downloadDir, timeoutMs = 300000) {
   log('🌐 [BrowserDL] Launching Chromium...');
   const browser = await puppeteer.launch({
@@ -640,8 +677,6 @@ async function downloadWithBrowser(url, downloadDir, timeoutMs = 300000) {
       '--disable-dev-shm-usage',
       '--disable-gpu',
       '--no-first-run',
-      '--no-zygote',
-      '--single-process',
       '--disable-blink-features=AutomationControlled',
     ],
     headless: 'new',
@@ -649,10 +684,17 @@ async function downloadWithBrowser(url, downloadDir, timeoutMs = 300000) {
 
   try {
     const page = await browser.newPage();
-    await page.setUserAgent(
-      'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    );
+    await applyStealthPatches(page);
 
+    // Step 1: Visit the site root to solve any Cloudflare challenge and get cookies
+    const urlObj = new URL(url);
+    const baseUrl = `${urlObj.protocol}//${urlObj.host}/`;
+    log(`🌐 [BrowserDL] Solving Cloudflare challenge at ${baseUrl}...`);
+    await page.goto(baseUrl, { timeout: 120000, waitUntil: 'domcontentloaded' });
+    await waitForCloudflare(page);
+    log('🌐 [BrowserDL] Cloudflare passed, proceeding to download...');
+
+    // Step 2: Configure download directory and navigate to the actual download URL
     const client = await page.createCDPSession();
     await client.send('Page.setDownloadBehavior', {
       behavior: 'allow',
@@ -664,6 +706,7 @@ async function downloadWithBrowser(url, downloadDir, timeoutMs = 300000) {
     log('🌐 [BrowserDL] Navigating to download URL...');
     page.goto(url, { timeout: 120000, waitUntil: 'load' }).catch(() => {});
 
+    // Step 3: Poll for the downloaded file
     const startTime = Date.now();
     let downloadedPath = null;
 
@@ -693,8 +736,6 @@ async function downloadWithBrowser(url, downloadDir, timeoutMs = 300000) {
         continue;
       }
 
-      // No download started and no file completed — if enough time has passed,
-      // the browser probably loaded an error page instead of triggering a download.
       if (Date.now() - startTime > 60000) {
         const title = await page.title().catch(() => '');
         const bodyText = await page.evaluate(() =>
