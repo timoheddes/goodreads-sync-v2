@@ -7,6 +7,7 @@ const Parser = require('rss-parser');
 const axios = require('axios');
 const cheerio = require('cheerio');
 const nodemailer = require('nodemailer');
+const puppeteer = require('puppeteer-core');
 
 // --- CONFIG ---
 const DB_PATH = process.env.DB_PATH || '/app/data/books.db';
@@ -627,48 +628,133 @@ async function findBookOnAnna(query, expectedTitle, expectedAuthor) {
 
 // --- DOWNLOAD ---
 
+const CHROMIUM_PATH = process.env.CHROMIUM_PATH || '/usr/bin/chromium-browser';
+
+async function downloadWithBrowser(url, downloadDir, timeoutMs = 300000) {
+  log('🌐 [BrowserDL] Launching Chromium...');
+  const browser = await puppeteer.launch({
+    executablePath: CHROMIUM_PATH,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--no-first-run',
+      '--no-zygote',
+      '--single-process',
+      '--disable-blink-features=AutomationControlled',
+    ],
+    headless: 'new',
+  });
+
+  try {
+    const page = await browser.newPage();
+    await page.setUserAgent(
+      'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    );
+
+    const client = await page.createCDPSession();
+    await client.send('Page.setDownloadBehavior', {
+      behavior: 'allow',
+      downloadPath: downloadDir,
+    });
+
+    const filesBefore = new Set(fs.readdirSync(downloadDir));
+
+    log('🌐 [BrowserDL] Navigating to download URL...');
+    page.goto(url, { timeout: 120000, waitUntil: 'load' }).catch(() => {});
+
+    const startTime = Date.now();
+    let downloadedPath = null;
+
+    while (Date.now() - startTime < timeoutMs) {
+      await sleep(3000);
+
+      const filesNow = fs.readdirSync(downloadDir);
+      const newFiles = filesNow.filter(f => !filesBefore.has(f));
+      const inProgress = newFiles.filter(f => f.endsWith('.crdownload'));
+      const completed = newFiles.filter(f => !f.endsWith('.crdownload'));
+
+      if (completed.length > 0) {
+        const candidate = path.join(downloadDir, completed[0]);
+        const size1 = fs.statSync(candidate).size;
+        await sleep(2000);
+        const size2 = fs.statSync(candidate).size;
+        if (size1 === size2 && size1 > 0) {
+          downloadedPath = candidate;
+          break;
+        }
+      }
+
+      if (inProgress.length > 0) {
+        const crPath = path.join(downloadDir, inProgress[0]);
+        const crSize = fs.statSync(crPath).size;
+        log(`🌐 [BrowserDL] Downloading... ${(crSize / 1024 / 1024).toFixed(1)} MB so far`);
+        continue;
+      }
+
+      // No download started and no file completed — if enough time has passed,
+      // the browser probably loaded an error page instead of triggering a download.
+      if (Date.now() - startTime > 60000) {
+        const title = await page.title().catch(() => '');
+        const bodyText = await page.evaluate(() =>
+          (document.body?.innerText || '').replace(/\s+/g, ' ').trim().substring(0, 500)
+        ).catch(() => '');
+        throw new Error(
+          `No download started after 60s. Page title: "${title}". Content: ${bodyText}`
+        );
+      }
+    }
+
+    if (!downloadedPath) {
+      throw new Error('Browser download timed out');
+    }
+
+    const size = fs.statSync(downloadedPath).size;
+    log(`🌐 [BrowserDL] Complete: ${path.basename(downloadedPath)} (${(size / 1024 / 1024).toFixed(2)} MB)`);
+    return downloadedPath;
+  } finally {
+    await browser.close();
+    log('🌐 [BrowserDL] Browser closed');
+  }
+}
+
 async function downloadBook(url, job) {
   const tempDir = path.join(path.dirname(DB_PATH), 'tmp');
   fs.mkdirSync(tempDir, { recursive: true });
 
-  let extraHeaders = {};
+  const safeTitle = sanitizeFilename(`${job.author || 'Unknown'} - ${job.title || 'Unknown'}`);
 
   if (url.includes('/fast_download/')) {
-    // fast_download is a direct file link (not an HTML page).
-    // Use FlareSolverr to obtain Cloudflare clearance cookies from the domain,
-    // then pass those cookies when downloading the file with axios.
-    const urlObj = new URL(url);
-    const baseUrl = `${urlObj.protocol}//${urlObj.host}/`;
-    log(`🛡️  [Download] Obtaining Cloudflare cookies via FlareSolverr (${baseUrl})...`);
+    // Cloudflare's cf_clearance cookie is bound to the TLS fingerprint (JA3) of the
+    // solving client. Node.js has a completely different JA3 than Chrome, so passing
+    // FlareSolverr cookies to axios always results in a 403. Use a real browser instead.
+    log('🌐 [Download] Using browser download for fast_download URL...');
+    const dlStart = Date.now();
 
-    const flareResponse = await axios.post(FLARESOLVERR_URL, {
-      cmd: 'request.get',
-      url: baseUrl,
-      maxTimeout: 120000,
-    }, {
-      timeout: 150000,
-      validateStatus: () => true,
-    });
+    const downloadedPath = await downloadWithBrowser(url, tempDir);
 
-    if (flareResponse.status !== 200 || !flareResponse.data || flareResponse.data.status !== 'ok') {
-      const msg = flareResponse.data?.message || flareResponse.data?.status || `HTTP ${flareResponse.status}`;
-      throw new Error(`FlareSolverr failed to obtain Cloudflare cookies: ${msg}`);
+    const stats = fs.statSync(downloadedPath);
+    const dlElapsed = ((Date.now() - dlStart) / 1000).toFixed(1);
+    log(`⬇️  [Download] Completed: ${(stats.size / 1024 / 1024).toFixed(2)} MB in ${dlElapsed}s`);
+
+    if (stats.size < 1024) {
+      const content = fs.readFileSync(downloadedPath, 'utf-8');
+      fs.unlinkSync(downloadedPath);
+      throw new Error(`Downloaded file too small (${stats.size} bytes), likely an error page: ${content.substring(0, 300)}`);
     }
 
-    const solution = flareResponse.data.solution;
-    const cookies = (solution.cookies || [])
-      .map(c => `${c.name}=${c.value}`)
-      .join('; ');
-    const userAgent = solution.userAgent || 'Mozilla/5.0';
-    log(`🛡️  [Download] Got ${solution.cookies?.length || 0} cookies, UA: ${userAgent.substring(0, 60)}...`);
+    const extension = path.extname(downloadedPath).toLowerCase() || '.epub';
+    const tempPath = path.join(tempDir, `${safeTitle}${extension}`);
+    if (downloadedPath !== tempPath) {
+      if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+      fs.renameSync(downloadedPath, tempPath);
+    }
 
-    extraHeaders = {
-      'Cookie': cookies,
-      'User-Agent': userAgent,
-    };
+    return { filePath: tempPath, extension };
   }
 
-  // Stream download the file
+  // Non-fast_download URLs: stream download with axios
   log(`⬇️  [Download] Starting stream download (5 min timeout)...`);
   const dlStart = Date.now();
 
@@ -676,23 +762,18 @@ async function downloadBook(url, job) {
     responseType: 'stream',
     timeout: 300000,
     maxRedirects: 10,
-    headers: extraHeaders,
   });
 
-  // Log response headers for debugging
   const contentType = response.headers['content-type'] || 'unknown';
   const contentLength = response.headers['content-length'] || 'unknown';
   const disposition = response.headers['content-disposition'] || 'none';
   log(`[Download] Response: status=${response.status}, content-type=${contentType}, content-length=${contentLength}, content-disposition=${disposition}`);
 
-  // Determine file extension from Content-Type or Content-Disposition
   const extension = getFileExtension(response);
   log(`[Download] Determined file extension: ${extension}`);
 
-  const safeTitle = sanitizeFilename(`${job.author || 'Unknown'} - ${job.title || 'Unknown'}`);
   const tempPath = path.join(tempDir, `${safeTitle}${extension}`);
 
-  // Stream to disk
   const writer = fs.createWriteStream(tempPath);
   await pipeline(response.data, writer);
 
@@ -701,7 +782,6 @@ async function downloadBook(url, job) {
   log(`⬇️  [Download] Completed: ${(stats.size / 1024 / 1024).toFixed(2)} MB in ${dlElapsed}s -> ${tempPath}`);
 
   if (stats.size < 1024) {
-    // File is suspiciously small (< 1KB), probably an error page
     const content = fs.readFileSync(tempPath, 'utf-8');
     fs.unlinkSync(tempPath);
     throw new Error(`Downloaded file too small (${stats.size} bytes), likely an error page: ${content.substring(0, 300)}`);
