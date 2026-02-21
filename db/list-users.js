@@ -1,4 +1,4 @@
-const Database = require('better-sqlite3');
+import Database from 'better-sqlite3';
 
 const DB_PATH = process.env.DB_PATH || '/app/data/books.db';
 

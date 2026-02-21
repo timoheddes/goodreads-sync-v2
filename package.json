@@ -1,7 +1,14 @@
 {
   "name": "nas-book-sync",
   "version": "1.0.0",
+  "type": "module",
   "main": "index.js",
+  "scripts": {
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
   "dependencies": {
     "axios": "^1.6.0",
     "better-sqlite3": "^9.0.0",
@@ -10,5 +17,12 @@
     "nodemailer": "^6.9.0",
     "puppeteer-core": "^24.0.0",
     "rss-parser": "^3.13.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.0.1",
+    "eslint-config-prettier": "^10.1.8",
+    "globals": "^17.3.0",
+    "prettier": "^3.8.1"
   }
 }

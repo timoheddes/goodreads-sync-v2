@@ -1,173 +1,21 @@
-const fs = require('fs');
-const path = require('path');
-const { pipeline } = require('stream/promises');
-const Database = require('better-sqlite3');
-const cron = require('node-cron');
-const Parser = require('rss-parser');
-const axios = require('axios');
-const cheerio = require('cheerio');
-const nodemailer = require('nodemailer');
-const puppeteer = require('puppeteer-core');
+import { mkdirSync, copyFileSync, unlinkSync, readdirSync, statSync, readFileSync, existsSync, renameSync, createWriteStream } from 'fs';
+import { join, basename, dirname, extname } from 'path';
+import { pipeline } from 'stream/promises';
+import { schedule } from 'node-cron';
+import Parser from 'rss-parser';
+import { post, get as _get } from 'axios';
+import { load } from 'cheerio';
+import { launch } from 'puppeteer-core';
 
-// --- CONFIG ---
-const DB_PATH = process.env.DB_PATH || '/app/data/books.db';
-const CRON_SCHEDULE = process.env.CRON_SCHEDULE || '0 * * * *';
-const AA_API_KEY = process.env.AA_API_KEY;
-const FLARESOLVERR_URL = process.env.FLARE_URL || 'http://flaresolverr:8191/v1';
-const MAX_ATTEMPTS = 5;
-const QUEUE_COOLDOWN_MS = 5000; // 5 seconds between queue items
-const MAX_DOWNLOADS_PER_USER_PER_DAY = parseInt(process.env.MAX_DOWNLOADS_PER_USER_PER_DAY || '10', 10);
-const MAX_DOWNLOADS_PER_DAY = parseInt(process.env.MAX_DOWNLOADS_PER_DAY || '50', 10);
-const SMTP_HOST = process.env.SMTP_HOST || 'localhost';
-const SMTP_PORT = parseInt(process.env.SMTP_PORT || '25', 10);
-const SMTP_FROM = process.env.SMTP_FROM || '';
+import { DB_PATH, CRON_SCHEDULE, AA_API_KEY, FLARESOLVERR_URL, MAX_ATTEMPTS, QUEUE_COOLDOWN_MS, MAX_DOWNLOADS_PER_USER_PER_DAY, MAX_DOWNLOADS_PER_DAY, SMTP_HOST, SMTP_PORT, SMTP_FROM, AA_DOMAINS } from './config.js';
 
-const AA_DOMAINS = [
-  'annas-archive.li',
-  'annas-archive.gl',
-];
+import { log, logError, logWarn } from './logging.js';
+import { sanitizeFilename, sleep, fixOwnership } from './utils.js';
+import { sendDownloadNotification } from './mailer.js';
+import { initDb, stmts, db } from './db.js';
 
-// --- LOGGING ---
-function timestamp() {
-  // Use TZ env var (e.g. Europe/Amsterdam) for local time; falls back to UTC
-  return new Date().toLocaleString('sv-SE', {
-    timeZone: process.env.TZ || 'UTC',
-    year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', second: '2-digit',
-    hour12: false,
-  });
-}
-
-function log(msg) {
-  console.log(`[${timestamp()}] ${msg}`);
-}
-
-function logError(msg, err) {
-  console.error(`[${timestamp()}] ❌ ${msg}`, err ? err.message : '');
-  if (err && err.stack) {
-    console.error(err.stack);
-  }
-}
-
-function logWarn(msg) {
-  console.warn(`[${timestamp()}] ⚠️  ${msg}`);
-}
-
-// --- DATABASE SETUP ---
-log(`🗄️  Initialising database at: ${DB_PATH}`);
-const db = new Database(DB_PATH);
-db.pragma('journal_mode = WAL');
-log('🗄️  Database connected (WAL mode)');
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    goodreads_id TEXT NOT NULL UNIQUE,
-    download_path TEXT NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS books (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    goodreads_book_id TEXT UNIQUE,
-    isbn TEXT,
-    title TEXT,
-    author TEXT,
-    status TEXT DEFAULT 'pending',
-    attempts INTEGER DEFAULT 0,
-    file_path TEXT,
-    added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS user_books (
-    user_id INTEGER,
-    book_id INTEGER,
-    is_notified INTEGER DEFAULT 0,
-    PRIMARY KEY (user_id, book_id),
-    FOREIGN KEY(user_id) REFERENCES users(id),
-    FOREIGN KEY(book_id) REFERENCES books(id)
-  );
-`);
-
-// Migrate: add goodreads_book_id column if it doesn't exist (for existing DBs)
-try {
-  db.exec(`ALTER TABLE books ADD COLUMN goodreads_book_id TEXT UNIQUE`);
-  log('🗄️  Migration: added goodreads_book_id column to books table');
-} catch (e) {
-  // Column already exists, ignore
-}
-
-// Migrate: add email column to users table
-try {
-  db.exec(`ALTER TABLE users ADD COLUMN email TEXT`);
-  log('🗄️  Migration: added email column to users table');
-} catch (e) {
-  // Column already exists, ignore
-}
-
-// Migrate: add downloaded_at column (updated_at gets bumped by RSS upserts, so it's unreliable for rate limiting)
-try {
-  db.exec(`ALTER TABLE books ADD COLUMN downloaded_at DATETIME`);
-  // Backfill: set downloaded_at for already-downloaded books that don't have it
-  db.exec(`UPDATE books SET downloaded_at = updated_at WHERE status = 'downloaded' AND downloaded_at IS NULL`);
-  log('🗄️  Migration: added downloaded_at column to books table');
-} catch (e) {
-  // Column already exists, ignore
-}
-
-// --- PREPARED STATEMENTS ---
-const stmts = {
-  getUsers: db.prepare('SELECT * FROM users'),
-  upsertBookByGoodreadsId: db.prepare(`
-    INSERT INTO books (goodreads_book_id, isbn, title, author)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT(goodreads_book_id) DO UPDATE SET
-      isbn = COALESCE(excluded.isbn, books.isbn),
-      title = COALESCE(excluded.title, books.title),
-      author = COALESCE(excluded.author, books.author),
-      updated_at = CURRENT_TIMESTAMP
-  `),
-  getBookByGoodreadsId: db.prepare('SELECT id FROM books WHERE goodreads_book_id = ?'),
-  linkUserBook: db.prepare('INSERT OR IGNORE INTO user_books (user_id, book_id) VALUES (?, ?)'),
-  getNextPending: db.prepare(`
-    SELECT * FROM books
-    WHERE status = 'pending'
-    AND attempts < ?
-    ORDER BY attempts ASC
-    LIMIT 1
-  `),
-  getUserPathsForBook: db.prepare(`
-    SELECT users.download_path
-    FROM users
-    JOIN user_books ON users.id = user_books.user_id
-    WHERE user_books.book_id = ?
-  `),
-  incrementAttempts: db.prepare('UPDATE books SET attempts = attempts + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?'),
-  markDownloaded: db.prepare(`UPDATE books SET status = 'downloaded', file_path = ?, downloaded_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`),
-  markFailed: db.prepare(`UPDATE books SET status = 'failed', updated_at = CURRENT_TIMESTAMP WHERE id = ?`),
-
-  // Daily download counts based on downloaded_at (not updated_at, which gets bumped by RSS upserts)
-  countDownloadsToday: db.prepare(`
-    SELECT COUNT(*) as cnt FROM books
-    WHERE status = 'downloaded' AND date(downloaded_at) = date('now')
-  `),
-  countUserDownloadsToday: db.prepare(`
-    SELECT COUNT(*) as cnt FROM books
-    JOIN user_books ON books.id = user_books.book_id
-    WHERE books.status = 'downloaded' AND date(books.downloaded_at) = date('now')
-    AND user_books.user_id = ?
-  `),
-  getUsersForBook: db.prepare(`
-    SELECT users.id, users.name, users.download_path, users.email
-    FROM users
-    JOIN user_books ON users.id = user_books.user_id
-    WHERE user_books.book_id = ?
-  `),
-};
 
 // --- RSS SYNC ---
-
 const rssParser = new Parser({
   customFields: {
     item: [
@@ -256,10 +104,6 @@ async function syncRSS() {
 }
 
 // --- QUEUE PROCESSING ---
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
 
 async function processQueue() {
   log('🔄 Processing queue...');
@@ -359,17 +203,18 @@ async function processQueue() {
 
       for (const user of eligibleUsers) {
         const destDir = user.download_path;
-        const destPath = path.join(destDir, filename);
+        const destPath = join(destDir, filename);
 
-        // Ensure the destination directory exists
-        fs.mkdirSync(destDir, { recursive: true });
-        fs.copyFileSync(tempPath, destPath);
+        mkdirSync(destDir, { recursive: true });
+        fixOwnership(destDir);
+        copyFileSync(tempPath, destPath);
+        fixOwnership(destPath);
         log(`💾 [Queue] Saved: ${destPath} (for ${user.name})`);
       }
 
       // Clean up temp file
       try {
-        fs.unlinkSync(tempPath);
+        unlinkSync(tempPath);
       } catch (cleanupErr) {
         logWarn(`[Queue] Could not delete temp file ${tempPath}: ${cleanupErr.message}`);
       }
@@ -522,7 +367,7 @@ async function findBookOnAnna(query, expectedTitle, expectedAuthor) {
       log(`🛡️  [Search] Sending request via FlareSolverr...`);
       const searchStart = Date.now();
 
-      const response = await axios.post(FLARESOLVERR_URL, {
+      const response = await post(FLARESOLVERR_URL, {
         cmd: 'request.get',
         url: searchUrl,
         maxTimeout: 120000,
@@ -547,7 +392,7 @@ async function findBookOnAnna(query, expectedTitle, expectedAuthor) {
       const html = response.data.solution.response;
       log(`🛡️  [Search] FlareSolverr responded OK (${searchElapsed}s, HTML: ${html.length} chars)`);
 
-      const $ = cheerio.load(html);
+      const $ = load(html);
 
       // Check if the results container exists at all
       const container = $('div.js-aarecord-list-outer');
@@ -632,6 +477,7 @@ const CHROMIUM_PATH = process.env.CHROMIUM_PATH || '/usr/bin/chromium-browser';
 
 async function applyStealthPatches(page) {
   await page.evaluateOnNewDocument(() => {
+    /* eslint-disable no-undef -- runs in browser context via Puppeteer */
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     Object.defineProperty(navigator, 'plugins', {
       get: () => [1, 2, 3, 4, 5],
@@ -645,6 +491,7 @@ async function applyStealthPatches(page) {
       params.name === 'notifications'
         ? Promise.resolve({ state: Notification.permission })
         : origQuery(params);
+    /* eslint-enable no-undef */
   });
   await page.setUserAgent(
     'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -669,7 +516,7 @@ async function waitForCloudflare(page, timeoutMs = 60000) {
 
 async function downloadWithBrowser(url, downloadDir, timeoutMs = 300000) {
   log('🌐 [BrowserDL] Launching Chromium...');
-  const browser = await puppeteer.launch({
+  const browser = await launch({
     executablePath: CHROMIUM_PATH,
     args: [
       '--no-sandbox',
@@ -726,7 +573,7 @@ async function downloadWithBrowser(url, downloadDir, timeoutMs = 300000) {
       downloadPath: downloadDir,
     });
 
-    const filesBefore = new Set(fs.readdirSync(downloadDir));
+    const filesBefore = new Set(readdirSync(downloadDir));
 
     log('🌐 [BrowserDL] Navigating to download URL...');
     page.goto(url, { timeout: timeoutMs, waitUntil: 'load' }).catch(() => {});
@@ -737,16 +584,16 @@ async function downloadWithBrowser(url, downloadDir, timeoutMs = 300000) {
     while (Date.now() - dlStart < timeoutMs) {
       await sleep(3000);
 
-      const filesNow = fs.readdirSync(downloadDir);
+      const filesNow = readdirSync(downloadDir);
       const newFiles = filesNow.filter(f => !filesBefore.has(f));
       const inProgress = newFiles.filter(f => f.endsWith('.crdownload'));
       const completed = newFiles.filter(f => !f.endsWith('.crdownload'));
 
       if (completed.length > 0) {
-        const candidate = path.join(downloadDir, completed[0]);
-        const size1 = fs.statSync(candidate).size;
+        const candidate = join(downloadDir, completed[0]);
+        const size1 = statSync(candidate).size;
         await sleep(2000);
-        const size2 = fs.statSync(candidate).size;
+        const size2 = statSync(candidate).size;
         if (size1 === size2 && size1 > 0) {
           downloadedPath = candidate;
           break;
@@ -754,8 +601,8 @@ async function downloadWithBrowser(url, downloadDir, timeoutMs = 300000) {
       }
 
       if (inProgress.length > 0) {
-        const crPath = path.join(downloadDir, inProgress[0]);
-        const crSize = fs.statSync(crPath).size;
+        const crPath = join(downloadDir, inProgress[0]);
+        const crSize = statSync(crPath).size;
         log(`🌐 [BrowserDL] Downloading... ${(crSize / 1024 / 1024).toFixed(1)} MB so far`);
         continue;
       }
@@ -764,6 +611,7 @@ async function downloadWithBrowser(url, downloadDir, timeoutMs = 300000) {
         const currentUrl = page.url();
         const title = await page.title().catch(() => '');
         const bodyText = await page.evaluate(() =>
+          // eslint-disable-next-line no-undef -- runs in browser context via Puppeteer
           (document.body?.innerText || '').replace(/\s+/g, ' ').trim().substring(0, 500)
         ).catch(() => '');
         throw new Error(
@@ -776,8 +624,8 @@ async function downloadWithBrowser(url, downloadDir, timeoutMs = 300000) {
       throw new Error('Browser download timed out');
     }
 
-    const size = fs.statSync(downloadedPath).size;
-    log(`🌐 [BrowserDL] Complete: ${path.basename(downloadedPath)} (${(size / 1024 / 1024).toFixed(2)} MB)`);
+    const size = statSync(downloadedPath).size;
+    log(`🌐 [BrowserDL] Complete: ${basename(downloadedPath)} (${(size / 1024 / 1024).toFixed(2)} MB)`);
     return downloadedPath;
   } finally {
     await browser.close();
@@ -786,8 +634,8 @@ async function downloadWithBrowser(url, downloadDir, timeoutMs = 300000) {
 }
 
 async function downloadBook(url, job) {
-  const tempDir = path.join(path.dirname(DB_PATH), 'tmp');
-  fs.mkdirSync(tempDir, { recursive: true });
+  const tempDir = join(dirname(DB_PATH), 'tmp');
+  mkdirSync(tempDir, { recursive: true });
 
   const safeTitle = sanitizeFilename(`${job.author || 'Unknown'} - ${job.title || 'Unknown'}`);
 
@@ -800,21 +648,21 @@ async function downloadBook(url, job) {
 
     const downloadedPath = await downloadWithBrowser(url, tempDir);
 
-    const stats = fs.statSync(downloadedPath);
+    const stats = statSync(downloadedPath);
     const dlElapsed = ((Date.now() - dlStart) / 1000).toFixed(1);
     log(`⬇️  [Download] Completed: ${(stats.size / 1024 / 1024).toFixed(2)} MB in ${dlElapsed}s`);
 
     if (stats.size < 1024) {
-      const content = fs.readFileSync(downloadedPath, 'utf-8');
-      fs.unlinkSync(downloadedPath);
+      const content = readFileSync(downloadedPath, 'utf-8');
+      unlinkSync(downloadedPath);
       throw new Error(`Downloaded file too small (${stats.size} bytes), likely an error page: ${content.substring(0, 300)}`);
     }
 
-    const extension = path.extname(downloadedPath).toLowerCase() || '.epub';
-    const tempPath = path.join(tempDir, `${safeTitle}${extension}`);
+    const extension = extname(downloadedPath).toLowerCase() || '.epub';
+    const tempPath = join(tempDir, `${safeTitle}${extension}`);
     if (downloadedPath !== tempPath) {
-      if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
-      fs.renameSync(downloadedPath, tempPath);
+      if (existsSync(tempPath)) unlinkSync(tempPath);
+      renameSync(downloadedPath, tempPath);
     }
 
     return { filePath: tempPath, extension };
@@ -824,7 +672,7 @@ async function downloadBook(url, job) {
   log(`⬇️  [Download] Starting stream download (5 min timeout)...`);
   const dlStart = Date.now();
 
-  const response = await axios.get(url, {
+  const response = await _get(url, {
     responseType: 'stream',
     timeout: 300000,
     maxRedirects: 10,
@@ -838,18 +686,18 @@ async function downloadBook(url, job) {
   const extension = getFileExtension(response);
   log(`[Download] Determined file extension: ${extension}`);
 
-  const tempPath = path.join(tempDir, `${safeTitle}${extension}`);
+  const tempPath = join(tempDir, `${safeTitle}${extension}`);
 
-  const writer = fs.createWriteStream(tempPath);
+  const writer = createWriteStream(tempPath);
   await pipeline(response.data, writer);
 
-  const stats = fs.statSync(tempPath);
+  const stats = statSync(tempPath);
   const dlElapsed = ((Date.now() - dlStart) / 1000).toFixed(1);
   log(`⬇️  [Download] Completed: ${(stats.size / 1024 / 1024).toFixed(2)} MB in ${dlElapsed}s -> ${tempPath}`);
 
   if (stats.size < 1024) {
-    const content = fs.readFileSync(tempPath, 'utf-8');
-    fs.unlinkSync(tempPath);
+    const content = readFileSync(tempPath, 'utf-8');
+    unlinkSync(tempPath);
     throw new Error(`Downloaded file too small (${stats.size} bytes), likely an error page: ${content.substring(0, 300)}`);
   }
 
@@ -863,7 +711,7 @@ function getFileExtension(response) {
     const filenameMatch = disposition.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/);
     if (filenameMatch) {
       const filename = filenameMatch[1].replace(/['"]/g, '');
-      const ext = path.extname(filename);
+      const ext = extname(filename);
       if (ext) return ext;
     }
   }
@@ -890,116 +738,14 @@ function getFileExtension(response) {
   // Try the URL path
   try {
     const urlPath = new URL(response.config.url || response.request.path).pathname;
-    const ext = path.extname(urlPath);
+    const ext = extname(urlPath);
     if (ext && ext.length <= 6) return ext;
-  } catch (e) { /* ignore */ }
+  } catch (e) { /* ignore */
+    void e;
+  }
 
   // Default to epub
   return '.epub';
-}
-
-// --- UTILITIES ---
-
-function sanitizeFilename(name) {
-  return name
-    .replace(/[<>:"/\\|?*]/g, '')  // Remove illegal chars
-    .replace(/\s+/g, ' ')           // Collapse whitespace
-    .trim()
-    .substring(0, 200);             // Cap length
-}
-
-// --- EMAIL NOTIFICATIONS ---
-
-const smtpTransport = nodemailer.createTransport({
-  host: SMTP_HOST,
-  port: SMTP_PORT,
-  secure: false,
-  tls: { rejectUnauthorized: false },
-});
-
-function buildEmailHtml(userName, books) {
-  const bookRows = books.map(b => `
-    <tr>
-      <td style="padding: 12px 16px; border-bottom: 1px solid #f0f0f0;">
-        <strong style="color: #1a1a1a;">${b.title || 'Unknown Title'}</strong>
-        <br>
-        <span style="color: #666; font-size: 14px;">${b.author || 'Unknown Author'}</span>
-      </td>
-    </tr>
-  `).join('');
-
-  return `
-<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"></head>
-<body style="margin: 0; padding: 0; background-color: #f5f5f5; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
-  <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #f5f5f5; padding: 32px 0;">
-    <tr>
-      <td align="center">
-        <table width="560" cellpadding="0" cellspacing="0" style="background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.08);">
-          <!-- Header -->
-          <tr>
-            <td style="background-color: #2d3748; padding: 28px 32px; text-align: center;">
-              <span style="font-size: 28px;">📚</span>
-              <h1 style="color: #ffffff; margin: 8px 0 0; font-size: 20px; font-weight: 600;">New books ready!</h1>
-            </td>
-          </tr>
-          <!-- Greeting -->
-          <tr>
-            <td style="padding: 28px 32px 16px;">
-              <p style="color: #333; font-size: 16px; margin: 0;">
-                Hi ${userName},
-              </p>
-              <p style="color: #555; font-size: 15px; margin: 12px 0 0;">
-                ${books.length === 1 ? 'A new book was' : `${books.length} new books were`} downloaded and ${books.length === 1 ? 'is' : 'are'} ready for you to read.
-              </p>
-            </td>
-          </tr>
-          <!-- Book list -->
-          <tr>
-            <td style="padding: 0 32px 24px;">
-              <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #fafafa; border-radius: 8px; border: 1px solid #eee;">
-                ${bookRows}
-              </table>
-            </td>
-          </tr>
-          <!-- Footer -->
-          <tr>
-            <td style="padding: 16px 32px 28px; text-align: center;">
-              <p style="color: #999; font-size: 13px; margin: 0;">Happy reading!</p>
-            </td>
-          </tr>
-        </table>
-      </td>
-    </tr>
-  </table>
-</body>
-</html>`;
-}
-
-async function sendDownloadNotification(user, books) {
-  if (!user.email) return;
-  if (!SMTP_FROM) {
-    logWarn(`[Email] SMTP_FROM not configured — skipping email for ${user.name}`);
-    return;
-  }
-  if (books.length === 0) return;
-
-  const subject = books.length === 1
-    ? `📚 "${books[0].title}" is ready to read`
-    : `📚 ${books.length} new books are ready to read`;
-
-  try {
-    await smtpTransport.sendMail({
-      from: SMTP_FROM,
-      to: user.email,
-      subject,
-      html: buildEmailHtml(user.name, books),
-    });
-    log(`📧 [Email] Sent notification to ${user.name} (${user.email}): ${books.length} book(s)`);
-  } catch (err) {
-    logError(`[Email] Failed to send to ${user.name} (${user.email})`, err);
-  }
 }
 
 // --- RUN CYCLE ---
@@ -1037,12 +783,13 @@ async function runCycle(trigger) {
 }
 
 // --- INIT ---
+initDb();
 log('🚀 === goodreads-sync service starting ===');
 log(`  📁 DB_PATH:        ${DB_PATH}`);
 log(`  ⏰ CRON_SCHEDULE:  ${CRON_SCHEDULE}`);
 log(`  🛡️ FLARESOLVERR:   ${FLARESOLVERR_URL}`);
 log(`  🌐 AA_DOMAINS:     ${AA_DOMAINS.join(', ')}`);
-log(`  🔑 AA_API_KEY:     ${AA_API_KEY ? '***' + AA_API_KEY.slice(-4) : 'NOT SET'}`);
+log(`  🔑 AA_API_KEY:     ${AA_API_KEY ? `***${  AA_API_KEY.slice(-4)}` : 'NOT SET'}`);
 log(`  🔁 MAX_ATTEMPTS:   ${MAX_ATTEMPTS}`);
 log(`  ⏱️ COOLDOWN:       ${QUEUE_COOLDOWN_MS}ms`);
 log(`  📊 DAILY_LIMIT:    ${MAX_DOWNLOADS_PER_DAY} overall, ${MAX_DOWNLOADS_PER_USER_PER_DAY} per user`);
@@ -1065,7 +812,7 @@ async function waitForFlareSolverr(maxRetries = 30, intervalMs = 5000) {
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      const res = await axios.get(FLARESOLVERR_URL.replace('/v1', '/health'), {
+      const res = await _get(FLARESOLVERR_URL.replace('/v1', '/health'), {
         timeout: 5000,
         validateStatus: () => true,
       });
@@ -1086,6 +833,6 @@ async function waitForFlareSolverr(maxRetries = 30, intervalMs = 5000) {
   await runCycle('startup');
 })();
 
-cron.schedule(CRON_SCHEDULE, async () => {
+schedule(CRON_SCHEDULE, async () => {
   await runCycle('cron');
 });

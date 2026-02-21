@@ -1,6 +1,4 @@
-const Database = require('better-sqlite3');
-const fs = require('fs');
-const path = require('path');
+import Database from 'better-sqlite3';
 
 const DB_PATH = process.env.DB_PATH || '/app/data/books.db';
 const flag = process.argv[2];
@@ -11,8 +9,8 @@ if (!validFlags.includes(flag)) {
   console.log('   Users are kept by default so you don\'t have to re-add them.');
   console.log('   On the next sync cycle, all "to-read" books will be re-queued as pending.\n');
   console.log('Usage:');
-  console.log('  node src/reset-db.js --confirm        Reset books only (keep users)');
-  console.log('  node src/reset-db.js --all            Reset everything (books + users)');
+  console.log('  node db/reset-db.js --confirm        Reset books only (keep users)');
+  console.log('  node db/reset-db.js --all            Reset everything (books + users)');
   process.exit(1);
 }
 

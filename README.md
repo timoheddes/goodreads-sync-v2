@@ -1,3 +1,5 @@
+> ❗ Note that this is a primarily "vibe-coded" application :)
+
 # Goodreads Sync
 
 Automatically downloads books from your Goodreads "to-read" shelf. Runs on a schedule (default: every hour), checks for new books, searches Anna's Archive, and saves EPUB files to a folder on your NAS.
@@ -155,17 +157,17 @@ node src/list-users.js
 
 All configuration is via environment variables in `docker-compose.yml`:
 
-| Variable          | Default                       | Description                                          |
-| ----------------- | ----------------------------- | ---------------------------------------------------- |
-| `AA_API_KEY`      | _(required)_                  | Anna's Archive API key (set in `.env`)               |
-| `DOWNLOADS_PATH`  | _(required)_                  | Host path to mount as `/downloads` (set in `.env`)   |
-| `CRON_SCHEDULE`   | `0 * * * *`                   | How often to sync (cron syntax, default: every hour) |
-| `FLARE_URL`     | `http://flaresolverr:8191/v1` | FlareSolverr endpoint                                |
-| `TZ`            | `Europe/Amsterdam`            | Timezone for logs and cron                           |
-| `DB_PATH`       | `/app/data/books.db`          | SQLite database path                                 |
-| `SMTP_USER`     | _(optional)_                  | Gmail address for the SMTP relay (set in `.env`)     |
-| `SMTP_PASS`     | _(optional)_                  | Gmail app password for the SMTP relay (set in `.env`) |
-| `SMTP_FROM`     | `${SMTP_USER}`                | Sender address for notification emails               |
+| Variable         | Default                       | Description                                           |
+| ---------------- | ----------------------------- | ----------------------------------------------------- |
+| `AA_API_KEY`     | _(required)_                  | Anna's Archive API key (set in `.env`)                |
+| `DOWNLOADS_PATH` | _(required)_                  | Host path to mount as `/downloads` (set in `.env`)    |
+| `CRON_SCHEDULE`  | `0 * * * *`                   | How often to sync (cron syntax, default: every hour)  |
+| `FLARE_URL`      | `http://flaresolverr:8191/v1` | FlareSolverr endpoint                                 |
+| `TZ`             | `Europe/Amsterdam`            | Timezone for logs and cron                            |
+| `DB_PATH`        | `/app/data/books.db`          | SQLite database path                                  |
+| `SMTP_USER`      | _(optional)_                  | Gmail address for the SMTP relay (set in `.env`)      |
+| `SMTP_PASS`      | _(optional)_                  | Gmail app password for the SMTP relay (set in `.env`) |
+| `SMTP_FROM`      | `${SMTP_USER}`                | Sender address for notification emails                |
 
 ## Manual trigger
 

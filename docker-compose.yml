@@ -34,6 +34,8 @@ services:
       - SMTP_FROM=${SMTP_USER}
       - MAX_DOWNLOADS_PER_USER_PER_DAY=${MAX_DOWNLOADS_PER_USER_PER_DAY}
       - MAX_DOWNLOADS_PER_DAY=${MAX_DOWNLOADS_PER_DAY}
+      - PUID=${PUID}
+      - PGID=${PGID}
     volumes:
       - book-sync-data:/app/data
       - ${DOWNLOADS_PATH}:/downloads
