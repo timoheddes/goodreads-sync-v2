@@ -694,13 +694,31 @@ async function downloadWithBrowser(url, downloadDir, timeoutMs = 300000) {
     await page.goto(baseUrl, { timeout: 120000, waitUntil: 'domcontentloaded' });
     await waitForCloudflare(page);
 
-    const cookies = await page.cookies();
-    const cookieNames = cookies.map(c => c.name).join(', ');
-    log(`🌐 [BrowserDL] Cloudflare passed (cookies: ${cookieNames})`);
+    log('🌐 [BrowserDL] Cloudflare passed');
 
-    // Step 2: Fetch the file using the browser's own fetch() API.
-    // This runs inside the page context — same origin, same TLS fingerprint,
-    // same cookies — so Cloudflare and AA see an identical request to a real browser.
+    // Step 2: Log into Anna's Archive using the API key (which is the AA "secret key")
+    if (!AA_API_KEY) throw new Error('AA_API_KEY is not set — cannot log in to Anna\'s Archive');
+
+    log('🌐 [BrowserDL] Logging into Anna\'s Archive...');
+    await page.goto(`${baseUrl}account`, { timeout: 60000, waitUntil: 'domcontentloaded' });
+    await waitForCloudflare(page);
+
+    await page.waitForSelector('input[name="key"]', { timeout: 15000 });
+    await page.type('input[name="key"]', AA_API_KEY, { delay: 30 });
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }),
+      page.$eval('input[name="key"]', el => el.closest('form').querySelector('button[type="submit"]').click()),
+    ]);
+
+    const postLoginUrl = page.url();
+    if (postLoginUrl.includes('/account')) {
+      log('🌐 [BrowserDL] Logged in successfully');
+    } else {
+      logWarn(`[BrowserDL] Login may have failed — landed on: ${postLoginUrl}`);
+    }
+
+    // Step 3: Fetch the file using the browser's own fetch() API.
+    // Now authenticated, same origin, same TLS fingerprint, same cookies.
     log('🌐 [BrowserDL] Fetching file via in-page fetch()...');
 
     const result = await page.evaluate(async (downloadUrl) => {
