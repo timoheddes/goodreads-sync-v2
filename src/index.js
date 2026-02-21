@@ -685,79 +685,102 @@ async function downloadWithBrowser(url, downloadDir, timeoutMs = 300000) {
   try {
     const page = await browser.newPage();
     await applyStealthPatches(page);
+    page.setDefaultTimeout(timeoutMs);
 
-    // Step 1: Visit the site root to solve any Cloudflare challenge and get cookies
+    // Step 1: Visit the site root to solve any Cloudflare challenge
     const urlObj = new URL(url);
     const baseUrl = `${urlObj.protocol}//${urlObj.host}/`;
     log(`🌐 [BrowserDL] Solving Cloudflare challenge at ${baseUrl}...`);
     await page.goto(baseUrl, { timeout: 120000, waitUntil: 'domcontentloaded' });
     await waitForCloudflare(page);
-    log('🌐 [BrowserDL] Cloudflare passed, proceeding to download...');
 
-    // Step 2: Configure download directory and navigate to the actual download URL
-    const client = await page.createCDPSession();
-    await client.send('Page.setDownloadBehavior', {
-      behavior: 'allow',
-      downloadPath: downloadDir,
-    });
+    const cookies = await page.cookies();
+    const cookieNames = cookies.map(c => c.name).join(', ');
+    log(`🌐 [BrowserDL] Cloudflare passed (cookies: ${cookieNames})`);
 
-    const filesBefore = new Set(fs.readdirSync(downloadDir));
+    // Step 2: Fetch the file using the browser's own fetch() API.
+    // This runs inside the page context — same origin, same TLS fingerprint,
+    // same cookies — so Cloudflare and AA see an identical request to a real browser.
+    log('🌐 [BrowserDL] Fetching file via in-page fetch()...');
 
-    log('🌐 [BrowserDL] Navigating to download URL...');
-    page.goto(url, { timeout: 120000, waitUntil: 'load' }).catch(() => {});
+    const result = await page.evaluate(async (downloadUrl) => {
+      const res = await fetch(downloadUrl, { redirect: 'follow', credentials: 'include' });
 
-    // Step 3: Poll for the downloaded file
-    const startTime = Date.now();
-    let downloadedPath = null;
+      const contentType = res.headers.get('content-type') || '';
+      const contentDisposition = res.headers.get('content-disposition') || '';
+      const finalUrl = res.url;
 
-    while (Date.now() - startTime < timeoutMs) {
-      await sleep(3000);
-
-      const filesNow = fs.readdirSync(downloadDir);
-      const newFiles = filesNow.filter(f => !filesBefore.has(f));
-      const inProgress = newFiles.filter(f => f.endsWith('.crdownload'));
-      const completed = newFiles.filter(f => !f.endsWith('.crdownload'));
-
-      if (completed.length > 0) {
-        const candidate = path.join(downloadDir, completed[0]);
-        const size1 = fs.statSync(candidate).size;
-        await sleep(2000);
-        const size2 = fs.statSync(candidate).size;
-        if (size1 === size2 && size1 > 0) {
-          downloadedPath = candidate;
-          break;
-        }
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        return {
+          ok: false, status: res.status, contentType, finalUrl,
+          text: text.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim().substring(0, 800),
+        };
       }
 
-      if (inProgress.length > 0) {
-        const crPath = path.join(downloadDir, inProgress[0]);
-        const crSize = fs.statSync(crPath).size;
-        log(`🌐 [BrowserDL] Downloading... ${(crSize / 1024 / 1024).toFixed(1)} MB so far`);
-        continue;
+      if (contentType.startsWith('text/html')) {
+        const text = await res.text();
+        return {
+          ok: false, status: res.status, contentType, finalUrl,
+          text: text.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim().substring(0, 800),
+        };
       }
 
-      if (Date.now() - startTime > 60000) {
-        const title = await page.title().catch(() => '');
-        const bodyText = await page.evaluate(() =>
-          (document.body?.innerText || '').replace(/\s+/g, ' ').trim().substring(0, 500)
-        ).catch(() => '');
-        throw new Error(
-          `No download started after 60s. Page title: "${title}". Content: ${bodyText}`
-        );
+      // Binary file — transfer as base64
+      const buffer = await res.arrayBuffer();
+      const bytes = new Uint8Array(buffer);
+      let binary = '';
+      const chunkSize = 32768;
+      for (let i = 0; i < bytes.length; i += chunkSize) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
       }
+
+      return {
+        ok: true, status: res.status, contentType, contentDisposition, finalUrl,
+        base64: btoa(binary),
+        size: bytes.length,
+      };
+    }, url);
+
+    if (!result.ok) {
+      throw new Error(
+        `fast_download returned ${result.contentType} (HTTP ${result.status}). ` +
+        `Final URL: ${result.finalUrl}. Content: ${result.text}`
+      );
     }
 
-    if (!downloadedPath) {
-      throw new Error('Browser download timed out');
+    log(`🌐 [BrowserDL] Received ${(result.size / 1024 / 1024).toFixed(2)} MB (${result.contentType})`);
+
+    // Determine filename from Content-Disposition header
+    let filename = `download${extensionFromMime(result.contentType)}`;
+    if (result.contentDisposition) {
+      const match = result.contentDisposition.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/);
+      if (match) filename = match[1].replace(/['"]/g, '').trim();
     }
 
-    const size = fs.statSync(downloadedPath).size;
-    log(`🌐 [BrowserDL] Complete: ${path.basename(downloadedPath)} (${(size / 1024 / 1024).toFixed(2)} MB)`);
-    return downloadedPath;
+    const filePath = path.join(downloadDir, filename);
+    fs.writeFileSync(filePath, Buffer.from(result.base64, 'base64'));
+
+    log(`🌐 [BrowserDL] Saved: ${path.basename(filePath)} (${(result.size / 1024 / 1024).toFixed(2)} MB)`);
+    return filePath;
   } finally {
     await browser.close();
     log('🌐 [BrowserDL] Browser closed');
   }
+}
+
+function extensionFromMime(mime) {
+  const map = {
+    'application/epub+zip': '.epub',
+    'application/pdf': '.pdf',
+    'application/x-mobipocket-ebook': '.mobi',
+    'application/vnd.amazon.ebook': '.azw3',
+    'application/x-cbz': '.cbz',
+    'application/x-cbr': '.cbr',
+    'application/zip': '.zip',
+    'application/octet-stream': '.epub',
+  };
+  return map[mime] || '.epub';
 }
 
 async function downloadBook(url, job) {
