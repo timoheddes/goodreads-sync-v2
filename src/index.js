@@ -3,7 +3,7 @@ import { join, basename, dirname, extname } from 'path';
 import { pipeline } from 'stream/promises';
 import { schedule } from 'node-cron';
 import Parser from 'rss-parser';
-import { post, get as _get } from 'axios';
+import axios from 'axios';
 import { load } from 'cheerio';
 import { launch } from 'puppeteer-core';
 
@@ -367,7 +367,7 @@ async function findBookOnAnna(query, expectedTitle, expectedAuthor) {
       log(`🛡️  [Search] Sending request via FlareSolverr...`);
       const searchStart = Date.now();
 
-      const response = await post(FLARESOLVERR_URL, {
+      const response = await axios.post(FLARESOLVERR_URL, {
         cmd: 'request.get',
         url: searchUrl,
         maxTimeout: 120000,
@@ -672,7 +672,7 @@ async function downloadBook(url, job) {
   log(`⬇️  [Download] Starting stream download (5 min timeout)...`);
   const dlStart = Date.now();
 
-  const response = await _get(url, {
+  const response = await axios.get(url, {
     responseType: 'stream',
     timeout: 300000,
     maxRedirects: 10,
@@ -812,7 +812,7 @@ async function waitForFlareSolverr(maxRetries = 30, intervalMs = 5000) {
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      const res = await _get(FLARESOLVERR_URL.replace('/v1', '/health'), {
+      const res = await axios.get(FLARESOLVERR_URL.replace('/v1', '/health'), {
         timeout: 5000,
         validateStatus: () => true,
       });
