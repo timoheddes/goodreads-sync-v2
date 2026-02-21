@@ -197,7 +197,7 @@ async function processQueue() {
       const { filePath: tempPath, extension } = await downloadBook(downloadUrl, job);
 
       // 3. COPY to eligible users' download folders (skip users at their daily limit)
-      const safeTitle = sanitizeFilename(`${job.author || 'Unknown'} - ${job.title || 'Unknown'}`);
+      const safeTitle = sanitizeFilename(`${job.title || 'Unknown'}`);
       const filename = `${safeTitle}${extension}`;
       log(`📂 [Queue] Copying "${filename}" to ${eligibleUsers.length} user folder(s)...`);
 
